@@ -62,5 +62,8 @@
     <ClCompile Include="SDK\PlayerController_BP_functions.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="SDK\UMG_MainMenuLayout_functions.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
 </Project>

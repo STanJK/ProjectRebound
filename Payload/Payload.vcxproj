@@ -157,6 +157,7 @@
     <ClCompile Include="SDK\ProjectBoundary_functions.cpp" />
     <ClCompile Include="SDK\UMG_functions.cpp" />
     <ClCompile Include="SDK\UMG_LoginGate_functions.cpp" />
+    <ClCompile Include="SDK\UMG_MainMenuLayout_functions.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

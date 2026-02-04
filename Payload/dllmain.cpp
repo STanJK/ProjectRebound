@@ -5,7 +5,9 @@
 #include "SDK/Engine_parameters.hpp"
 #include "SDK/ProjectBoundary_parameters.hpp"
 #include "safetyhook/safetyhook.hpp"
+#include "json.hpp"
 #include <iostream>
+#include <fstream>
 
 #include "libreplicate.h"
 
@@ -18,6 +20,15 @@ uintptr_t BaseAddress = 0x0;
 bool listening = false;
 
 bool amServer = false;
+
+struct ServerConfig {
+    std::wstring MapName;
+    std::wstring FullModePath;
+    unsigned int Port;
+    bool NumPlayersToStartAt;
+};
+
+static ServerConfig Config{};
 
 std::vector<UObject*> getObjectsOfClass(UClass* theClass, bool includeDefault) {
     std::vector<UObject*> ret = std::vector<UObject*>();
@@ -62,13 +73,15 @@ UObject* GetLastOfType(UClass* theClass, bool includeDefault) {
 }
 
 void EnableUnrealConsole() {
-    SDK::UInputSettings::GetDefaultObj()->ConsoleKeys[0].KeyName = SDK::UKismetStringLibrary::Conv_StringToName(L"F1");
+    SDK::UInputSettings::GetDefaultObj()->ConsoleKeys[0].KeyName = SDK::UKismetStringLibrary::Conv_StringToName(L"F2");
 
     /* Creates a new UObject of class-type specified by Engine->ConsoleClass */
     SDK::UObject* NewObject = SDK::UGameplayStatics::SpawnObject(UEngine::GetEngine()->ConsoleClass, UEngine::GetEngine()->GameViewport);
 
     /* The Object we created is a subclass of UConsole, so this cast is **safe**. */
     UEngine::GetEngine()->GameViewport->ViewportConsole = static_cast<SDK::UConsole*>(NewObject);
+
+    std::cout << "[DEBUG] Unreal Console => F2" << std::endl;
 }
 
 SafetyHookInline TickFlush = {};
@@ -205,33 +218,6 @@ void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
         }
     }
 
-    if (GetAsyncKeyState(VK_F2)) {
-        ((UProjectBoundaryUserSettings*)(GetLastOfType(UProjectBoundaryUserSettings::StaticClass(), true)))->bIsDedicatedServer = true;
-
-        std::cout << "start scan" << std::endl;
-
-        for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
-        {
-            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
-
-            if (!Obj)
-                continue;
-
-            if (Obj->IsA(USkeletalMeshComponent::StaticClass()))
-            {
-                if (!((USkeletalMeshComponent*)Obj)->bEnablePhysicsOnDedicatedServer) {
-                    std::cout << Obj->GetFullName() << std::endl;
-                    std::cout << "WEE WOO WEE WOO" << std::endl;
-                }
-
-            }
-        }
-
-        while (GetAsyncKeyState(VK_F2)) {
-
-        }
-    }
-
     if (GetAsyncKeyState(VK_F8) && amServer) {
         for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
         {
@@ -272,8 +258,10 @@ void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
 
             if (Obj->IsA(APBPlayerController::StaticClass()))
             {
-                std::cout << Obj->GetFullName() << std::endl;
-                ((APBPlayerController*)Obj)->PBCharacter->NotifyZeroHealth();
+                ((APBPlayerController*)Obj)->K2_PawnReplicatedPossess();
+                ((APBPlayerController*)Obj)->NotifyStopKillCamera();
+                ((APBPlayerController*)Obj)->StopKillCamera();
+                ((APBPlayerController*)Obj)->StopThirdPersonCamera();
             }
         }
 
@@ -346,66 +334,68 @@ char ViewportShitHook(__int64 a1, float a2) {
 
 //__int64 *__fastcall sub_141561A60(__int64 a1, __int64 *a2, unsigned __int64 a3, unsigned __int8 a4)
 
+int NumPlayersSelectedRole = 0;
+
 SafetyHookInline ProcessEvent;
 
 bool canStartMatch = false;
 
+bool AllowedToRespawn = false;
+
+std::unordered_map<APBPlayerController*, bool> PlayerRespawnAllowedMap{};
+
 void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
-    if (Function->GetFullName().contains("NotifyBePossessedByLocalPlayer")) {
-        return;
-        //std::cout << "[PE] " << Object->GetFullName() << " - " << Function->GetFullName() << std::endl;
+    if (Function->GetFullName().contains("QuickRespawn")) {
+        APBPlayerController* PBPlayerController = (APBPlayerController*)Object;
+
+        PlayerRespawnAllowedMap[PBPlayerController] = true;
+    }
+
+    if (Function->GetFullName().contains("ServerRestartPlayer") ) {
+        APBPlayerController* PBPlayerController = (APBPlayerController*)Object;
+
+        if (PlayerRespawnAllowedMap.contains(PBPlayerController) && PlayerRespawnAllowedMap[PBPlayerController] == false) {
+            std::cout << "Denied restart!" << std::endl;
+            return;
+        }
     }
 
     //ReceivePossess
 
     if (Function->GetFullName().contains("ServerConfirmRoleSelection")) {
-        if (!canStartMatch) {
+        NumPlayersSelectedRole++;
+
+        if (!canStartMatch && NumPlayersSelectedRole >= Config.NumPlayersToStartAt) {
             canStartMatch = true;
         }
     }
 
-    /*
+
     if (Function->GetFullName().contains("ReadyToMatchIntro_WaitingToStart")) {
         if (!canStartMatch) {
             return;
         }
     }
-    */
-
-    if (Function->GetFullName().contains("IsDedicatedServer")) {
-        std::cout << "[PE] " << Object->GetFullName() << " - " << Function->GetFullName() << std::endl;
-    }
 
     if (Function->GetFullName().contains("ClientBeKilled")) {
         std::cout << "Intercepted Player Kill!" << std::endl;
 
-        APBPlayerController* Controller = reinterpret_cast<APBPlayerController*>(Object);
+        APBPlayerController* PBPlayerController = (APBPlayerController*)Object;
 
-        if (!Controller->bShowSelectRole) {
-            Controller->ClientSelectRole();
-        }
+        PlayerRespawnAllowedMap[PBPlayerController] = false;
         //std::cout << "[PE] " << Object->GetFullName() << " - " << Function->GetFullName() << std::endl;
-    }
-
-    if (Function->GetFullName().contains("QuickRespawn")) {
-        std::cout << "Intercepted Player Restart!" << std::endl;
-
-        APBPlayerController* Controller = reinterpret_cast<APBPlayerController*>(Object);
-
-        if (!Controller->bShowSelectRole) {
-            Controller->ClientSelectRole();
-        }
-
-        //UWorld::GetWorld()->AuthorityGameMode->RestartPlayerAtPlayerStart(Controller, (APlayerStart*)GetLastOfType(APlayerStart::StaticClass(), false));
-
-        //Controller->Possess(Controller->Pawn);
-
-        return;
     }
 
     if (Function->GetFullName().contains("PlayerCanRestart")) {
         std::cout << "YEPPERS WE CAN RESTART" << std::endl;
         ((Params::GameModeBase_PlayerCanRestart*)Parms)->ReturnValue = ((AGameModeBase*)Object)->HasMatchStarted();
+        /*
+        if (!((AGameModeBase*)Object)->HasMatchStarted()) {
+            if (!((APBPlayerController*)((Params::GameModeBase_PlayerCanRestart*)Parms)->Player)->bShowSelectRole) {
+                ((APBPlayerController*)((Params::GameModeBase_PlayerCanRestart*)Parms)->Player)->ClientSelectRole();
+            }
+        }
+        */
         return;
     }
 
@@ -421,33 +411,8 @@ __int64 HudFunctionThatCrashesTheGameHook(__int64 a1, __int64 a2) {
 SafetyHookInline ProcessEventClient;
 
 void ProcessEventHookClient(UObject* Object, UFunction* Function, void* Parms) {
-    if (Object->IsA(UPBItemFieldModWidget_Inventory::StaticClass())) {
-        ((UPBItemFieldModWidget_Inventory*)(Object))->bIsLocked = false;
-        ((UPBItemFieldModWidget_Inventory*)(Object))->bIsItemLock = false;
-    }
-
-    if (Object->IsA(UUMG_CharacterItem_C::StaticClass())) {
-        ((UUMG_CharacterItem_C*)(Object))->bIsLocked = false;
-        ((UUMG_CharacterItem_C*)(Object))->bIsLocking = false;
-    }
-
-    /*
-    if (Function->GetFullName().contains("Item") || Function->GetFullName().contains("Unlock") || Function->GetFullName().contains("Lock") || Function->GetFullName().contains("Own")) {
+    if (Function->GetFullName().contains("HasItem")) {
         std::cout << "[PE] " << Object->GetFullName() << " - " << Function->GetFullName() << std::endl;
-    }
-    */
-
-    //
-    if (Function->GetFullName().contains("OnKeyDown") && ((APBPlayerController*)(UWorld::GetWorld()->OwningGameInstance->LocalPlayers[0]->PlayerController))->bShowSelectRole) {
-        std::cout << "Theoretically denied close cuz hud bug!" << std::endl;
-        return;
-    }
-
-    if (Object->IsA(UUMG_DeployCharacter_C::StaticClass()) && Function->GetFullName().contains("BndEvt__UMG_DeployCharacter_UMG_STD_HotZone_K2Node_ComponentBoundEvent_3_OnClick__DelegateSignature")) {
-        if (((AGameStateBase*)(GetLastOfType(AGameStateBase::StaticClass(), false)))->HasMatchStarted() && ((APBPlayerController*)(UWorld::GetWorld()->OwningGameInstance->LocalPlayers[0]->PlayerController))->PBPlayerState->LastUpdatedPlayerLifeStatus != EPBPlayerLifeStatus::Alive) {
-            std::cout << "Theoretically denied close!" << std::endl;
-            return;
-        }
     }
 
     return ProcessEventClient.call(Object, Function, Parms);
@@ -478,12 +443,27 @@ __int64 ClientDeathCrashHook(__int64 a1) {
     return 0;
 }
 
+SafetyHookInline ObjectNeedsLoad;
+
+char ObjectNeedsLoadHook(UObject* a1) {
+    return 1;
+}
+
+SafetyHookInline ActorNeedsLoad;
+
+char ActorNeedsLoadHook(UObject* a1) {
+    return 1;
+}
+
 void InitServerHooks() {
     NotifyActorDestroyed = safetyhook::create_inline((void*)(BaseAddress + 0x33403E0), NotifyActorDestroyedHook);
     NotifyAcceptingConnection = safetyhook::create_inline((void*)(BaseAddress + 0x36CDC90), NotifyAcceptingConnectionHook);
     NotifyControlMessage = safetyhook::create_inline((void*)(BaseAddress + 0x36CDCE0), NotifyControlMessageHook);
     TickFlush = safetyhook::create_inline((void*)(BaseAddress + 0x33E05F0), TickFlushHook);
     ProcessEvent = safetyhook::create_inline((void*)(BaseAddress + 0x1BCBE40), ProcessEventHook);
+    ObjectNeedsLoad = safetyhook::create_inline((void*)(BaseAddress + 0x1B7B710), ObjectNeedsLoadHook);
+    ActorNeedsLoad = safetyhook::create_inline((void*)(BaseAddress + 0x3124E70), ActorNeedsLoadHook);
+
     //GameEngineTick = safetyhook::create_inline((void*)(BaseAddress + 0x350b3a0), GameEngineTickHook);
     //HudFunctionThatCrashesTheGame = safetyhook::create_inline((void*)(BaseAddress + 0x180B060), HudFunctionThatCrashesTheGameHook);
 
@@ -496,7 +476,16 @@ void InitClientHook() {
     ClientDeathCrash = safetyhook::create_inline((void*)(BaseAddress + 0x16abe10), ClientDeathCrashHook);
 }
 
+void LoadConfig() {
+    Config.FullModePath = L"/Game/Online/GameMode/BP_PBGameMode_Rush_PVE_Easy.BP_PBGameMode_Rush_PVE_Easy_C";
+    Config.MapName = L"DataCenter";
+    Config.NumPlayersToStartAt = 1;
+    Config.Port = 7777;
+}
+
 bool hidden = false;
+
+const wchar_t* LocalURL = L"http://127.0.0.1:8000\0";
 
 void MainThread() {
     AllocConsole();
@@ -522,7 +511,11 @@ void MainThread() {
     if (amServer) {
         InitServerHooks();
 
-        UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"open GangesRiver", nullptr); //
+        LoadConfig();
+
+        std::wstring cmd = L"open " + Config.MapName + L"?game=" + Config.FullModePath;
+
+        UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), cmd.c_str(), nullptr); //
 
         Sleep(8 * 1000);
 
@@ -545,25 +538,55 @@ void MainThread() {
         
         World->NetDriver = NetDriver;
 
-        libReplicate->Listen((void*)NetDriver, (void*)World, LibReplicate::EJoinMode::Open, 7777);
+        libReplicate->Listen((void*)NetDriver, (void*)World, LibReplicate::EJoinMode::Open, Config.Port);
 
         World->NetDriver = NetDriver;
 
         listening = true;
     }
     else {
+        EnableUnrealConsole();
+
         InitClientHook();
 
-        EnableUnrealConsole();
+        //*(const wchar_t***)(BaseAddress + 0x5C63C88) = &LocalURL;
+
+
+        for (UObject* obj : getObjectsOfClass(UPBArmoryManager::StaticClass(), false)) {
+            UPBArmoryManager* DefaultConfig = (UPBArmoryManager*)obj;
+
+            std::ifstream items("DT_ItemType.json");
+            nlohmann::json itemJson = nlohmann::json::parse(items);
+
+            for (auto& [ItemId, _] : itemJson[0]["Rows"].items()) {
+                std::string aString = std::string(ItemId.c_str());
+
+                std::wstring wString = std::wstring(aString.begin(), aString.end());
+                if(DefaultConfig->DefaultConfig)
+                    DefaultConfig->DefaultConfig->OwnedItems.Add(UKismetStringLibrary::Conv_StringToName(wString.c_str()));
+
+                FPBItem item{};
+
+                item.ID = UKismetStringLibrary::Conv_StringToName(wString.c_str());
+                item.Count = 1;
+                item.bIsNew = false;
+
+                DefaultConfig->Armorys.OwnedItems.Add(item);
+            }
+        }
 
         Sleep(5 * 1000);
 
-        UCommonActivatableWidget* widget = nullptr;
-        reinterpret_cast<UPBMainMenuManager_BP_C*>(getObjectsOfClass(UPBMainMenuManager_BP_C::StaticClass(), false).back())->GetTopMenuWidget(&widget);
-        widget->SetVisibility(ESlateVisibility::Hidden);
-        widget->DeactivateWidget();
+        //UCommonActivatableWidget* widget = nullptr;
+        //reinterpret_cast<UPBMainMenuManager_BP_C*>(getObjectsOfClass(UPBMainMenuManager_BP_C::StaticClass(), false).back())->GetTopMenuWidget(&widget);
+        //widget->SetVisibility(ESlateVisibility::Hidden);
+        //widget->DeactivateWidget();
 
-        UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"open 127.0.0.1", nullptr);
+        //reinterpret_cast<UUMG_MainMenuLayout_C*>(getObjectsOfClass(UUMG_MainMenuLayout_C::StaticClass(), false).back())->OnJoinGame();
+
+        //UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"open 127.0.0.1", nullptr);
+
+        //UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"open 127.0.0.1", nullptr);
     }
 }
 

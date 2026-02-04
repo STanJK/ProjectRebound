@@ -124,6 +124,36 @@ void LibReplicate::CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::v
 		this->CallPreReplicationFuncPtr(ActorInfo.ActorPtr, NetDriver);
 	}
 
+	for (UNetConnection* Connection : Connections) {
+		for (auto const &ActorInfo : Actors) {
+			if (ActorInfo.bNetTemporary && HaveWeSentThisTemporaryActor(Connection, ActorInfo.ActorPtr))
+				continue;
+
+			UActorChannel* Channel = GetChannelForActor(Connection, ActorInfo.ActorPtr);
+
+			if (!Channel) {
+
+				Channel = this->CreateChannelFuncPtr(Connection, (FName*)ActorChannelName, 1 << 1, -1);
+
+				if (Channel) {
+					AddActorChannelToChannels(Connection, Channel, ActorInfo.ActorPtr);
+
+					this->SetChannelActorFuncPtr(Channel, ActorInfo.ActorPtr, 0);
+				}
+			}
+
+			if (!(*(unsigned int*)((__int64)Channel + 0x88) & 0x2)) {
+				*(unsigned int*)((__int64)Channel + 0x88) |= 2;
+			}
+
+			if (Channel) {
+				if (this->ReplicateActorFuncPtr(Channel)) {
+					//std::cout << ((SDK::UObject*)ActorInfo.ActorPtr)->GetFullName() << std::endl;
+				};
+			}
+		}
+	}
+
 	for (auto const& PlayerControllerInfo : PlayerControllers) {
 		this->CallPreReplicationFuncPtr(PlayerControllerInfo.PlayerController, NetDriver);
 
@@ -147,38 +177,10 @@ void LibReplicate::CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::v
 		}
 	}
 
-	for (UNetConnection* Connection : Connections) {
-		for (auto const &ActorInfo : Actors) {
-			if (ActorInfo.bNetTemporary && HaveWeSentThisTemporaryActor(Connection, ActorInfo.ActorPtr))
-				continue;
-
-			UActorChannel* Channel = GetChannelForActor(Connection, ActorInfo.ActorPtr);
-
-			if (!Channel) {
-
-				Channel = this->CreateChannelFuncPtr(Connection, (FName*)ActorChannelName, 1 << 1, -1);
-
-				if (Channel) {
-					AddActorChannelToChannels(Connection, Channel, ActorInfo.ActorPtr);
-
-					this->SetChannelActorFuncPtr(Channel, ActorInfo.ActorPtr, 0);
-				}
-			}
-
-			*(unsigned int*)((__int64)Channel + 0x88) |= 2;
-
-			if (Channel) {
-				if (this->ReplicateActorFuncPtr(Channel)) {
-					//std::cout << ((SDK::UObject*)ActorInfo.ActorPtr)->GetFullName() << std::endl;
-				};
-			}
-		}
-	}
-
-	if (!this->ChannelsToClose->empty()) {
-		{
-			std::scoped_lock t(this->ChannelsToCloseMutex);
-
+	
+	{
+		std::scoped_lock t(this->ChannelsToCloseMutex);
+		if (!this->ChannelsToClose->empty()) {
 			while (this->ChannelsToClose->size() > 0) {
 				UActorChannel* Channel = this->ChannelsToClose->back();
 
