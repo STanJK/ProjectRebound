@@ -124,6 +124,29 @@ void LibReplicate::CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::v
 		this->CallPreReplicationFuncPtr(ActorInfo.ActorPtr, NetDriver);
 	}
 
+	for (auto const& PlayerControllerInfo : PlayerControllers) {
+		this->CallPreReplicationFuncPtr(PlayerControllerInfo.PlayerController, NetDriver);
+
+		this->SendClientAdjustmentFuncPtr(PlayerControllerInfo.PlayerController);
+
+		UActorChannel* Channel = GetChannelForActor(PlayerControllerInfo.OwningConnection, PlayerControllerInfo.PlayerController);
+
+		if (!Channel) {
+
+			Channel = this->CreateChannelFuncPtr(PlayerControllerInfo.OwningConnection, (FName*)ActorChannelName, 1 << 1, -1);
+
+			if (Channel) {
+				AddActorChannelToChannels(PlayerControllerInfo.OwningConnection, Channel, PlayerControllerInfo.PlayerController);
+
+				this->SetChannelActorFuncPtr(Channel, PlayerControllerInfo.PlayerController, 0);
+			}
+		}
+
+		if (Channel) {
+			this->ReplicateActorFuncPtr(Channel);
+		}
+	}
+
 	for (UNetConnection* Connection : Connections) {
 		for (auto const &ActorInfo : Actors) {
 			if (ActorInfo.bNetTemporary && HaveWeSentThisTemporaryActor(Connection, ActorInfo.ActorPtr))
@@ -154,30 +177,7 @@ void LibReplicate::CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::v
 		}
 	}
 
-	for (auto const& PlayerControllerInfo : PlayerControllers) {
-		this->CallPreReplicationFuncPtr(PlayerControllerInfo.PlayerController, NetDriver);
-
-		this->SendClientAdjustmentFuncPtr(PlayerControllerInfo.PlayerController);
-
-		UActorChannel* Channel = GetChannelForActor(PlayerControllerInfo.OwningConnection, PlayerControllerInfo.PlayerController);
-
-		if (!Channel) {
-
-			Channel = this->CreateChannelFuncPtr(PlayerControllerInfo.OwningConnection, (FName*)ActorChannelName, 1 << 1, -1);
-
-			if (Channel) {
-				AddActorChannelToChannels(PlayerControllerInfo.OwningConnection, Channel, PlayerControllerInfo.PlayerController);
-
-				this->SetChannelActorFuncPtr(Channel, PlayerControllerInfo.PlayerController, 0);
-			}
-		}
-
-		if (Channel) {
-			this->ReplicateActorFuncPtr(Channel);
-		}
-	}
-
-	
+	/*
 	{
 		std::scoped_lock t(this->ChannelsToCloseMutex);
 		if (!this->ChannelsToClose->empty()) {
@@ -189,7 +189,7 @@ void LibReplicate::CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::v
 				this->ChannelsToClose->pop_back();
 			}
 		}
-	}
+	}*/
 }
 
 void LibReplicate::CallWhenActorDestroyed(FActorInfo& ActorInfo) {

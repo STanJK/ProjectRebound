@@ -25,7 +25,8 @@ struct ServerConfig {
     std::wstring MapName;
     std::wstring FullModePath;
     unsigned int Port;
-    int NumPlayersToStartAt;
+    bool IsPvE;
+    int MinPlayersToStart;
 };
 
 static ServerConfig Config{};
@@ -102,19 +103,13 @@ bool DidProcStartMatch = false;
 
 bool canStartMatch = false;
 
+int NumExpectedPlayers = -1;
+
+float MatchStartCountdown = -1.0f;
 
 void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
     if (listening && NetDriver && UWorld::GetWorld()) {
         //std::cout << DeltaTime << std::endl;
-
-        if (!DidProcFlow && NumPlayersJoined >= Config.NumPlayersToStartAt) {
-            DidProcFlow = true;
-
-            std::cout << "All players connected, beginning role selection flow!" << std::endl;
-
-            PlayerJoinTimerSelectFuck = 5.0f;
-        }
-
 
         if (PlayerJoinTimerSelectFuck > 0.0f) {
             PlayerJoinTimerSelectFuck -= DeltaTime;
@@ -249,9 +244,44 @@ void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
     }
 
     if (!((APBGameState*)(UWorld::GetWorld()->AuthorityGameMode->GameState))->IsRoundInProgress()) {
-        for (UNetConnection* pc : NetDriver->ClientConnections) {
-            if (pc->PlayerController && pc->PlayerController->Pawn)
-                pc->PlayerController->Possess(pc->PlayerController->Pawn);
+        if (((APBGameState*)(UWorld::GetWorld()->AuthorityGameMode->GameState))->RoundState.ToString().contains("InvalidState")) {
+
+            if (NumPlayersJoined >= Config.MinPlayersToStart) {
+                if (!DidProcFlow) {
+                    if (MatchStartCountdown == -1.0f) {
+                        MatchStartCountdown = 30.0f;
+
+                        NumExpectedPlayers = NumPlayersJoined;
+                    }
+                    else {
+                        MatchStartCountdown -= DeltaTime;
+
+                        if (NumExpectedPlayers > NumPlayersJoined) {
+                            NumExpectedPlayers = NumPlayersJoined;
+
+                            MatchStartCountdown += 15.0f;
+                        }
+
+                        if (MatchStartCountdown <= 0.0f) {
+                            DidProcFlow = true;
+
+                            std::cout << "All players connected, beginning role selection flow!" << std::endl;
+
+                            PlayerJoinTimerSelectFuck = 5.0f;
+
+                            NumExpectedPlayers = NumPlayersJoined;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (((APBGameState*)(UWorld::GetWorld()->AuthorityGameMode->GameState))->RoundState.ToString().contains("CountdownToStart")) {
+
+            for (UNetConnection* pc : NetDriver->ClientConnections) {
+                if (pc->PlayerController && pc->PlayerController->Pawn)
+                    pc->PlayerController->Possess(pc->PlayerController->Pawn);
+            }
         }
     }
 
@@ -283,12 +313,7 @@ void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
 
             if (Obj->IsA(APBPlayerController::StaticClass()))
             {
-                if (((APBPlayerController*)Obj)->CanSelectRole()) {
-                    ((APBPlayerController*)Obj)->ClientSelectRole();
-                }
-                else {
-                    std::cout << "CANT SELECT ROLE WEE WOO WEE WOO" << std::endl;
-                }
+                ((APBPlayerController*)Obj)->ServerSuicide(0);
             }
         }
 
@@ -365,7 +390,7 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     if (Function->GetFullName().contains("ServerConfirmRoleSelection")) {
         NumPlayersSelectedRole++;
 
-        if (!canStartMatch && NumPlayersSelectedRole >= Config.NumPlayersToStartAt) {
+        if (!canStartMatch && NumPlayersSelectedRole >= NumExpectedPlayers) {
             canStartMatch = true;
 
             //((APBGameMode*)UWorld::GetWorld()->AuthorityGameMode)->StartMatch();
@@ -389,8 +414,11 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
     }
 
     if (Function->GetFullName().contains("PlayerCanRestart")) {
-        std::cout << "YEPPERS WE CAN RESTART" << std::endl;
+        //std::cout << "YEPPERS WE CAN RESTART" << std::endl;
+        // 
         ((Params::GameModeBase_PlayerCanRestart*)Parms)->ReturnValue = ((AGameModeBase*)Object)->HasMatchStarted();
+        // 
+        //((Params::GameModeBase_PlayerCanRestart*)Parms)->ReturnValue = ((AGameModeBase*)Object)->HasMatchStarted();
         /*
         if (!((AGameModeBase*)Object)->HasMatchStarted()) {
             if (!((APBPlayerController*)((Params::GameModeBase_PlayerCanRestart*)Parms)->Player)->bShowSelectRole) {
@@ -419,7 +447,7 @@ void ConnectToMatch() {
 
     LocalPlayer->GoToRange(0.0f);
 
-    UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"travel 73.130.167.222", nullptr);
+    UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"travel 204.12.195.98", nullptr);
 
     GameInstance->ShowLoadingScreen(true, true);
 }
@@ -544,11 +572,27 @@ void InitClientHook() {
     ClientDeathCrash = safetyhook::create_inline((void*)(BaseAddress + 0x16abe10), ClientDeathCrashHook);
 }
 
+#include <random>
+
+const std::vector<const wchar_t*> Maps = { L"CircularX", L"DataCenter", L"Dusty", L"GangesRiver", L"Oriolus", L"RelayStation", L"Warehouse", L"MiniFarm", L"Museum", L"OSS" };
+
 void LoadConfig() {
-    Config.FullModePath = L"/Game/Online/GameMode/PBGameMode_Capture_BP.PBGameMode_Capture_BP_C";
-    Config.MapName = L"Warehouse";
-    Config.NumPlayersToStartAt = 2;
+    Config.IsPvE = std::string(GetCommandLineA()).contains("-pve");
+
+    Config.FullModePath = Config.IsPvE ? L"/Game/Online/GameMode/BP_PBGameMode_Rush_PVE_Hard.BP_PBGameMode_Rush_PVE_Hard_C" : L"/Game/Online/GameMode/PBGameMode_Rush_BP.PBGameMode_Rush_BP_C";
+    
+    std::mt19937 rng(std::random_device{}());
+
+    std::uniform_int_distribution<> dist(0, Maps.size());
+    
+    Config.MapName = Maps[dist(rng)];
     Config.Port = 7777;
+    if (Config.IsPvE) {
+        Config.MinPlayersToStart = 1;
+    }
+    else {
+        Config.MinPlayersToStart = 2;
+    }
 }
 
 bool hidden = false;
@@ -581,7 +625,7 @@ void MainThread() {
 
         LoadConfig();
 
-        UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"t.maxfps 128", nullptr);
+        UKismetSystemLibrary::ExecuteConsoleCommand(UWorld::GetWorld(), L"t.maxfps 30", nullptr);
 
         std::wstring cmd = L"open " + Config.MapName + L"?game=" + Config.FullModePath;
 
