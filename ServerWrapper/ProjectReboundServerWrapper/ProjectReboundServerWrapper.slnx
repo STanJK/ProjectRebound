@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ProjectReboundServerWrapper/ProjectReboundServerWrapper.vcxproj" Id="2a0bae3a-d090-41c0-b80b-fd361e5ca0a7" />
+</Solution>
