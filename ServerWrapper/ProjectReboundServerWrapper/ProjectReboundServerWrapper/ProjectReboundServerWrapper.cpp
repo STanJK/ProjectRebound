@@ -7,6 +7,8 @@
 #include <iomanip>
 #include <filesystem>
 #include <random>
+#pragma comment(lib, "ws2_32.lib")
+
 
 #define NOMINMAX
 
@@ -15,7 +17,12 @@ HANDLE g_ServerProcess = NULL;
 std::string CurrentMap = "Warehouse";
 std::string CurrentMode = "pve";
 std::string LastMap = "";
+std::string CurrentDifficulty = "normal";
 std::atomic<bool> ServerRunning = false;
+int g_ConsecutiveFailures = 0;
+std::chrono::steady_clock::time_point g_LastFailureTime;
+const int MAX_FAILURES = 3;
+const auto FAILURE_RESET_WINDOW = std::chrono::minutes(1);
 
 //Forward Declaration
 void LauncherLog(const std::string& msg);
@@ -145,6 +152,29 @@ void SetMode(const std::string& mode)
     }
 }
 
+void SetDifficulty(const std::string& diff)
+{
+    if (_stricmp(diff.c_str(), "easy") == 0)
+    {
+        CurrentDifficulty = "easy";
+        LauncherLog("Difficulty set to EASY.");
+    }
+    else if (_stricmp(diff.c_str(), "normal") == 0)
+    {
+        CurrentDifficulty = "normal";
+        LauncherLog("Difficulty set to NORMAL.");
+    }
+    else if (_stricmp(diff.c_str(), "hard") == 0)
+    {
+        CurrentDifficulty = "hard";
+        LauncherLog("Difficulty set to HARD.");
+    }
+    else
+    {
+        LauncherLog("Invalid difficulty. Use: easy, normal, hard");
+    }
+}
+
 void KillServer()
 {
     if (g_ServerProcess)
@@ -164,6 +194,33 @@ void KillServer()
 
 void RestartServer()
 {
+	//Check if mutiple failures happen within the reset window
+    auto now = std::chrono::steady_clock::now();
+    if (now - g_LastFailureTime < FAILURE_RESET_WINDOW) {
+        g_ConsecutiveFailures++;
+    }
+    else {
+        g_ConsecutiveFailures = 1;
+    }
+    g_LastFailureTime = now;
+
+	// Exceed max failures, stop auto-restart and alert user
+    if (g_ConsecutiveFailures >= MAX_FAILURES) {
+        LauncherLog("CRITICAL: Server failed to start 3 times in 1 minute. Stopping auto-restart.");
+        MessageBoxA(NULL,
+            "Server failed to start repeatedly.\n"
+            "Possible reasons:\n"
+            "- Port 7777 is occupied by another program.\n"
+            "- Map file missing or corrupt.\n"
+            "- Antivirus blocking the executable.\n\n"
+            "Please check the logs and restart the launcher manually.",
+            "Project Boundary Server Wrapper",
+            MB_OK | MB_ICONERROR);
+        ServerRunning = false;
+        g_ConsecutiveFailures = 0; //reset counter
+        return;
+    }
+
     LauncherLog("Restarting server...");
     KillServer();
     Sleep(500);
@@ -197,6 +254,11 @@ void InputThread()
         else if (cmd == "restart")
         {
             RestartServer();
+        }
+        else if (cmd.rfind("difficulty ", 0) == 0)
+        {
+            std::string diff = cmd.substr(11);
+            SetDifficulty(diff);
         }
         else
         {
@@ -240,9 +302,9 @@ void PipeReader(HANDLE pipe)
         std::string msg(buffer);
 
         // Detect heartbeat
-        if (msg.find("[HEARTBEAT]") != std::string::npos)
-        {
+        if (msg.find("[HEARTBEAT]") != std::string::npos) {
             lastHeartbeatTime = std::chrono::steady_clock::now();
+			g_ConsecutiveFailures = 0;  //Clear counter on successful heartbeat
             LauncherLog("Heartbeat received");
         }
 
@@ -322,8 +384,39 @@ void StartWatchdog()
         }).detach();
 }
 
+bool IsPortAvailable(int port, bool useTCP = false)
+{
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
+        return false;
+
+    int sockType = useTCP ? SOCK_STREAM : SOCK_DGRAM;
+    int protocol = useTCP ? IPPROTO_TCP : IPPROTO_UDP;
+    SOCKET sock = socket(AF_INET, sockType, protocol);
+    if (sock == INVALID_SOCKET) {
+        WSACleanup();
+        return false;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    int result = bind(sock, (sockaddr*)&addr, sizeof(addr));
+    closesocket(sock);
+    WSACleanup();
+
+    return result != SOCKET_ERROR;
+}
+
 void LaunchServer()
 {
+    int serverPort = 7777;
+    if (!IsPortAvailable(serverPort)) {
+        LauncherLog("ERROR: UDP Port " + std::to_string(serverPort) + " is already in use!");
+        return;
+    }
     LastMap = CurrentMap;
     LauncherLog("Launching server process...");
 
@@ -343,10 +436,21 @@ void LaunchServer()
     PROCESS_INFORMATION pi{};
 
     // Build mode path
-    std::string modePath =
-        (CurrentMode == "pve")
-        ? "/Game/Online/GameMode/BP_PBGameMode_Rush_PVE_Hard.BP_PBGameMode_Rush_PVE_Hard_C"
-        : "/Game/Online/GameMode/PBGameMode_Rush_BP.PBGameMode_Rush_BP_C";
+    std::string modePath;
+
+    if (CurrentMode == "pve")
+    {
+        if (CurrentDifficulty == "easy")
+            modePath = "/Game/Online/GameMode/BP_PBGameMode_Rush_PVE_Easy.BP_PBGameMode_Rush_PVE_Easy_C";
+        else if (CurrentDifficulty == "hard")
+            modePath = "/Game/Online/GameMode/BP_PBGameMode_Rush_PVE_Hard.BP_PBGameMode_Rush_PVE_Hard_C";
+        else
+            modePath = "/Game/Online/GameMode/BP_PBGameMode_Rush_PVE_Normal.BP_PBGameMode_Rush_PVE_Normal_C";
+    }
+    else
+    {
+        modePath = "/Game/Online/GameMode/PBGameMode_Rush_BP.PBGameMode_Rush_BP_C";
+    }
 
     // Build command line
     std::wstring cmd =
@@ -354,7 +458,7 @@ void LaunchServer()
         L"-log -server -nullrhi "
         L"-map=" + std::wstring(CurrentMap.begin(), CurrentMap.end()) + L" "
         L"-mode=" + std::wstring(modePath.begin(), modePath.end()) + L" "
-        L"-port=7777 "
+        L"-port=" + std::to_wstring(serverPort) + L" "
         + (CurrentMode == "pve" ? L"-pve" : L"");
 
     if (!CreateProcessW(
@@ -383,6 +487,7 @@ void LaunchServer()
     LauncherLog("Server launched. PID = " + std::to_string(pi.dwProcessId));
 
     Sleep(500);
+
 
     // Exit watcher
     std::thread([=]() {
@@ -417,6 +522,16 @@ void LaunchServer()
 
 int main()
 {
+    //set port, this part should belongs to a outside function later
+    int g_ServerPort = 7777;
+    std::string cmdLine = GetCommandLineA();
+    size_t pos = cmdLine.find("-port=");
+    if (pos != std::string::npos) {
+        pos += 6;
+        size_t end = cmdLine.find(" ", pos);
+        std::string portStr = cmdLine.substr(pos, end - pos);
+        g_ServerPort = std::stoi(portStr);
+    }
     lastHeartbeatTime = std::chrono::steady_clock::now();
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
