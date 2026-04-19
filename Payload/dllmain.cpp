@@ -189,13 +189,15 @@ nlohmann::json BuildServerStatusPayload()
     std::string map = std::string(Config.MapName.begin(), Config.MapName.end());
     std::string mode = std::string(Config.FullModePath.begin(), Config.FullModePath.end());
 
-    std::string state;
+    std::string state = "Unknown";
 
-    APBGameState* GS = (APBGameState*)UWorld::GetWorld()->AuthorityGameMode->GameState;
-    if (GS)
+    // FIXED: Add proper null checks before dereferencing
+    UWorld* World = UWorld::GetWorld();
+    if (World && World->AuthorityGameMode && World->AuthorityGameMode->GameState)
+    {
+        APBGameState* GS = (APBGameState*)World->AuthorityGameMode->GameState;
         state = GS->RoundState.ToString();
-    else
-        state = "Unknown";
+    }
 
     nlohmann::json payload = {
         { "name",         Config.ServerName },
@@ -1104,22 +1106,6 @@ void MainThread()
             InitServerHooks();
             Log("[SERVER] Hooks installed.");
 
-            // Heartbeat thread (game + backend)
-            std::thread([]() {
-                while (true)
-                {
-                    int pc = GetCurrentPlayerCount();
-                    std::cout << "[HEARTBEAT] PlayerCount = " << pc << std::endl;
-
-                    if (!OnlineBackendAddress.empty())
-                    {
-                        SendServerStatus(OnlineBackendAddress);
-                    }
-
-                    Sleep(5000);
-                }
-                }).detach();
-
             // Wait for world
             Log("[SERVER] Waiting for UWorld...");
             while (!UWorld::GetWorld())
@@ -1145,6 +1131,29 @@ void MainThread()
             Log("[SERVER] LibReplicate initialized.");
 
             StartServer();
+
+            // Heartbeat thread (game + backend)
+            std::thread([]() {
+                // Wait until Gamestate is Valid
+                while (!UWorld::GetWorld() ||
+                    !UWorld::GetWorld()->AuthorityGameMode ||
+                    !UWorld::GetWorld()->AuthorityGameMode->GameState)
+                {
+                    Sleep(100);
+                }
+                while (true)
+                {
+                    int pc = GetCurrentPlayerCount();
+                    std::cout << "[HEARTBEAT] PlayerCount = " << pc << std::endl;
+
+                    if (!OnlineBackendAddress.empty())
+                    {
+                        SendServerStatus(OnlineBackendAddress);
+                    }
+
+                    Sleep(5000);
+                }
+                }).detach();
         }
 
         else {
