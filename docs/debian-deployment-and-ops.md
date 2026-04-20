@@ -348,7 +348,7 @@ A 机器：
 2. A 的 `Port` 仍填公网代理端口，例如 `7777`。
 3. A 创建房间时，GUI 会先向服务器 UDP `5001` 做 rendezvous，然后启动本地 `project_rebound_udp_proxy.py host`。
 4. A 的游戏服务端会被启动在 `Port + 1`，例如 `7778`；公网 `7777` 由 proxy 监听。
-5. B 加入房间时，GUI 会启动本地 `project_rebound_udp_proxy.py client`，并把游戏客户端启动为 `-match=127.0.0.1:<Client Proxy>`。
+5. B 加入房间时，GUI 会启动本地 `project_rebound_udp_proxy.py client`，并把游戏客户端启动为 `-LogicServerURL=http://127.0.0.1:8000 -match=127.0.0.1:<Client Proxy>`。
 6. 服务器只负责交换双方公网 UDP endpoint 和 punch ticket，不转发游戏包。
 7. 对于端口受限 NAT，client proxy 收到 host punch 包后会把后续游戏包发往实际收到的 host endpoint，而不是只依赖 rendezvous 阶段观察到的 endpoint。
 
@@ -641,6 +641,39 @@ sudo journalctl -u projectrebound-matchserver -n 120 --no-pager
 ```
 
 云厂商安全组也要放行 `5001/udp`。Nginx 不代理这个 UDP 端口。
+
+期望能看到类似：
+
+```text
+UNCONN 0 0 0.0.0.0:5001 0.0.0.0:* users:(("dotnet",pid=...,fd=...))
+```
+
+日志里也应有：
+
+```text
+UDP rendezvous service listening on 0.0.0.0:5001
+```
+
+如果 `ss` 看不到 `5001`：
+
+- 确认服务器已部署包含 UDP Proxy 的新版后端。
+- 确认 `appsettings.json` 或环境变量中 `MatchServer:UdpRendezvousPort` 是 `5001`。
+- 重启服务：`sudo systemctl restart projectrebound-matchserver`。
+
+如果 `ss` 能看到 `5001`，但 GUI 仍超时：
+
+- 放行 Debian 防火墙：`sudo ufw allow 5001/udp`。
+- 放行云厂商安全组 / 防火墙的 `5001/udp` 入站。
+- 确认 GUI 报错里显示的目标是你的服务器公网 IP 或域名，而不是 `127.0.0.1`、内网 IP 或旧地址。
+- 临时关闭 Windows 防火墙或安全软件测试出站 UDP。
+
+可以在服务器上抓包确认 UDP 是否到达：
+
+```bash
+sudo tcpdump -ni any udp port 5001
+```
+
+如果抓不到包，问题在服务器外侧防火墙、云安全组、路由或 Windows 出站网络。如果抓得到包但 GUI 没有响应，查看后端日志是否有 `UDP rendezvous packet failed`。
 
 ### 房间创建成功但别人连不上
 

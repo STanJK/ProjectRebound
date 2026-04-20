@@ -19,7 +19,8 @@ Desktop\ProjectRebound.Browser.Python\run_browser.bat
 - Start the backend first: `dotnet run --project Backend\ProjectRebound.MatchServer\ProjectRebound.MatchServer.csproj`
 - Config is saved to `%APPDATA%\ProjectReboundBrowser\config-python.json`.
 - Create Room and Quick Match require the selected UDP port to be reachable from the backend.
-- Join still launches the game with `-match=ip:port`.
+- Join launches the game with `-LogicServerURL=http://127.0.0.1:8000 -match=ip:port` by default. `Logic URL` can be changed in the GUI.
+- Client game launch intentionally does not use `CREATE_NEW_CONSOLE`; proxy and wrapper still open their own consoles for logs.
 - Create Room launches `ProjectReboundServerWrapper.exe` when it can find it under the configured game directory.
 - This Python prototype is the current recommended GUI path; the WPF prototype remains in the repo but is not the active target.
 

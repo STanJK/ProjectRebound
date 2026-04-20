@@ -17,6 +17,7 @@ from urllib import error, parse, request
 
 APP_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "ProjectReboundBrowser"
 CONFIG_PATH = APP_DIR / "config-python.json"
+GUI_LOG_PATH = APP_DIR / "browser-launch.log"
 
 
 @dataclass
@@ -34,6 +35,7 @@ class AppConfig:
     max_players: int = 8
     use_udp_proxy: bool = False
     proxy_client_port: int = 17777
+    logic_server_url: str = "http://127.0.0.1:8000"
 
 
 class ApiError(RuntimeError):
@@ -141,6 +143,12 @@ def save_config(config: AppConfig) -> None:
         json.dump(asdict(config), file, indent=2)
 
 
+def append_gui_log(message: str) -> None:
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    with GUI_LOG_PATH.open("a", encoding="utf-8") as file:
+        file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+
+
 def find_file(root: str, file_name: str) -> str | None:
     if not root or not os.path.isdir(root):
         return None
@@ -215,6 +223,7 @@ class BrowserApp(tk.Tk):
         self.max_players_var = tk.IntVar(value=self.config_data.max_players)
         self.use_proxy_var = tk.BooleanVar(value=self.config_data.use_udp_proxy)
         self.proxy_client_port_var = tk.IntVar(value=self.config_data.proxy_client_port)
+        self.logic_server_url_var = tk.StringVar(value=self.config_data.logic_server_url)
 
         self._field(room_box, "Name", self.room_name_var, 0, 0, width=24)
         self._field(room_box, "Map", self.map_var, 0, 2, width=16)
@@ -223,6 +232,7 @@ class BrowserApp(tk.Tk):
         self._field(room_box, "Max", self.max_players_var, 0, 8, width=8)
         ttk.Checkbutton(room_box, text="Use UDP Proxy", variable=self.use_proxy_var).grid(row=1, column=0, sticky="w", padx=4, pady=4)
         self._field(room_box, "Client Proxy", self.proxy_client_port_var, 1, 2, width=8)
+        self._field(room_box, "Logic URL", self.logic_server_url_var, 1, 4, width=32)
 
         buttons = ttk.Frame(room_box)
         buttons.grid(row=0, column=10, sticky="e", padx=(12, 0))
@@ -299,6 +309,7 @@ class BrowserApp(tk.Tk):
             max_players=int(self.max_players_var.get()),
             use_udp_proxy=bool(self.use_proxy_var.get()),
             proxy_client_port=int(self.proxy_client_port_var.get()),
+            logic_server_url=self.logic_server_url_var.get().strip() or "http://127.0.0.1:8000",
         )
 
     def initialize(self) -> None:
@@ -451,13 +462,19 @@ class BrowserApp(tk.Tk):
                     continue
                 if response.get("token") == created["bindingToken"]:
                     return self.api.confirm_nat_binding(created["bindingToken"])
-        raise RuntimeError("UDP rendezvous timed out. Check server UDP 5001 and local firewall.")
+        raise RuntimeError(f"UDP rendezvous timed out. Sent to {server[0]}:{server[1]}. Check server UDP 5001, cloud security group, and local firewall.")
 
     def start_client(self, connect: str) -> None:
         exe = find_file(self.config_data.game_directory, "ProjectBoundarySteam-Win64-Shipping.exe")
         if not exe:
             raise RuntimeError("ProjectBoundarySteam-Win64-Shipping.exe was not found under the game directory.")
-        subprocess.Popen([exe, f"-match={connect}"], cwd=str(Path(exe).parent), creationflags=self.creation_flags())
+        args = [
+            exe,
+            f"-LogicServerURL={self.config_data.logic_server_url}",
+            f"-match={connect}",
+        ]
+        append_gui_log("Launching client: " + subprocess.list2cmdline(args))
+        subprocess.Popen(args, cwd=str(Path(exe).parent), creationflags=self.client_creation_flags())
 
     def start_client_proxy(self, room_id: str, join_ticket: str) -> None:
         proxy = Path(__file__).with_name("project_rebound_udp_proxy.py")
@@ -497,6 +514,7 @@ class BrowserApp(tk.Tk):
                 f"-serverregion={room.get('region', self.config_data.region)}",
                 f"-port={game_port}",
             ]
+            append_gui_log("Launching wrapper: " + subprocess.list2cmdline(args))
             subprocess.Popen(args, cwd=str(Path(wrapper).parent), creationflags=self.creation_flags())
             return
 
@@ -519,6 +537,7 @@ class BrowserApp(tk.Tk):
         ]
         if room.get("mode", self.config_data.mode).lower() == "pve":
             args.append("-pve")
+        append_gui_log("Launching server exe: " + subprocess.list2cmdline(args))
         subprocess.Popen(args, cwd=str(Path(exe).parent), creationflags=self.creation_flags())
 
     def start_host_proxy(self, room_id: str, host_token: str, game_port: int) -> None:
@@ -597,6 +616,10 @@ class BrowserApp(tk.Tk):
     @staticmethod
     def creation_flags() -> int:
         return getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+
+    @staticmethod
+    def client_creation_flags() -> int:
+        return 0
 
 
 if __name__ == "__main__":

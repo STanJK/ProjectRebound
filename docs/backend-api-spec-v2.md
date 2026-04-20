@@ -29,7 +29,7 @@
 6. GUI 启动 host：`ProjectReboundServerWrapper.exe -online=<backend_host:port> -roomid=<roomId> -hosttoken=<hostToken> ...`
 7. Payload 优先发 `/v1/rooms/{roomId}/heartbeat`；旧 `/server/status` 带 `roomId/hostToken` 时也映射到房间心跳。
 8. 浏览器用 `GET /v1/rooms` 展示房间。
-9. 玩家加入时调 `POST /v1/rooms/{roomId}/join`，拿到 `connect: "ip:port"` 后用现有 `-match=ip:port` 直连。
+9. 玩家加入时调 `POST /v1/rooms/{roomId}/join`，拿到 `connect: "ip:port"` 后启动客户端：`ProjectBoundarySteam-Win64-Shipping.exe -LogicServerURL=http://127.0.0.1:8000 -match=ip:port`。
 
 ## 3. 数据模型
 

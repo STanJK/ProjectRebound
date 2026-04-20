@@ -92,7 +92,7 @@ def register_binding(api: ApiClient, sock: socket.socket, local_port: int, role:
         if response.get("token") == created["bindingToken"]:
             break
     else:
-        raise ApiError("UDP rendezvous timed out.")
+        raise ApiError(f"UDP rendezvous timed out. Sent to {server[0]}:{server[1]}.")
 
     return api.post(f"/v1/nat/bindings/{created['bindingToken']}/confirm")
 
