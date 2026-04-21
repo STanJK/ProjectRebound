@@ -605,7 +605,7 @@ class BrowserApp(tk.Tk):
             lines.append(f"echo [Launcher] Fake login server already reachable at {endpoint[0]}:{endpoint[1]}.")
         else:
             lines.extend([
-                f"start /B /D {quote_bat(backend_dir)} {quote_bat(node)} index.js",
+                f'start "" /B /D {quote_bat(backend_dir)} {quote_bat(node)} ' + quote_bat("index.js"),
                 "echo [Launcher] Waiting for login server to initialize...",
                 "timeout /t 5 >nul",
             ])
@@ -848,7 +848,7 @@ class BrowserApp(tk.Tk):
             lines.append(f"echo [Launcher] Fake login server already reachable at {endpoint[0]}:{endpoint[1]}.")
         else:
             lines.extend([
-                f"start /B /D {quote_bat(backend_dir)} {quote_bat(node)} index.js",
+                f'start "" /B /D {quote_bat(backend_dir)} {quote_bat(node)} ' + quote_bat("index.js"),
                 "echo [Launcher] Waiting for login server to initialize...",
                 "timeout /t 5 >nul",
             ])
