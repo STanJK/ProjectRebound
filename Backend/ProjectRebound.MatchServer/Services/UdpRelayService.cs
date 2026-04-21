@@ -22,7 +22,7 @@ public sealed class UdpRelayService(
             try
             {
                 var result = await udp.ReceiveAsync(stoppingToken);
-                if (TryHandleControlPacket(udp, result.Buffer, result.RemoteEndPoint, stoppingToken))
+                if (TryHandleControlPacket(udp, result.Buffer, result.RemoteEndPoint))
                 {
                     continue;
                 }
@@ -43,7 +43,7 @@ public sealed class UdpRelayService(
         }
     }
 
-    private bool TryHandleControlPacket(UdpClient udp, byte[] buffer, IPEndPoint remoteEndPoint, CancellationToken cancellationToken)
+    private bool TryHandleControlPacket(UdpClient udp, byte[] buffer, IPEndPoint remoteEndPoint)
     {
         if (buffer.Length == 0 || buffer[0] != (byte)'{')
         {
@@ -69,6 +69,13 @@ public sealed class UdpRelayService(
         }
 
         var registration = store.ObserveRegistration(packet.SessionId.Value, packet.Role, packet.Secret, remoteEndPoint);
+        logger.LogInformation(
+            "UDP relay registration {Status}: session={SessionId} role={Role} remote={RemoteEndPoint}",
+            registration is null ? "rejected" : "accepted",
+            packet.SessionId,
+            packet.Role,
+            remoteEndPoint);
+
         var response = registration is null
             ? JsonSerializer.Serialize(new
             {
@@ -81,11 +88,13 @@ public sealed class UdpRelayService(
                 type = "PRB_RELAY_REGISTERED_V1",
                 ok = true,
                 sessionId = registration.SessionId,
-                role = registration.Role
+                role = registration.Role,
+                observedIp = registration.EndPoint.Address.ToString(),
+                observedPort = registration.EndPoint.Port
             }, JsonOptions);
 
         var bytes = Encoding.UTF8.GetBytes(response);
-        _ = udp.SendAsync(bytes, bytes.Length, remoteEndPoint);
+        udp.Send(bytes, bytes.Length, remoteEndPoint);
         return true;
     }
 

@@ -315,7 +315,13 @@ def run_host(args: argparse.Namespace, ready_queue: queue.Queue[HostRoom] | None
                 continue
 
             if packet.get("type") == RELAY_REGISTERED:
-                relay_registered = bool(packet.get("ok"))
+                ok = bool(packet.get("ok"))
+                if ok != relay_registered:
+                    observed = ""
+                    if ok and packet.get("observedIp") and packet.get("observedPort"):
+                        observed = f" observed={packet['observedIp']}:{packet['observedPort']}"
+                    log(f"host relay registration {'accepted' if ok else 'rejected'}{observed}")
+                relay_registered = ok
                 continue
 
             if packet.get("type") == PUNCH_MAGIC:
@@ -395,7 +401,7 @@ def run_client(args: argparse.Namespace) -> int:
             sock.sendto(relay_packet, relay_target)
             last_relay_register = now
 
-        if now - last_ping > 0.5:
+        if now - last_ping > 0.5 and (relay_target is None or relay_registered):
             sequence += 1
             payload = test_ping(ticket_id, nonce, sequence)
             if relay_target is not None:
@@ -422,7 +428,13 @@ def run_client(args: argparse.Namespace) -> int:
             continue
 
         if packet.get("type") == RELAY_REGISTERED:
-            relay_registered = bool(packet.get("ok"))
+            ok = bool(packet.get("ok"))
+            if ok != relay_registered:
+                observed = ""
+                if ok and packet.get("observedIp") and packet.get("observedPort"):
+                    observed = f" observed={packet['observedIp']}:{packet['observedPort']}"
+                log(f"client relay registration {'accepted' if ok else 'rejected'}{observed}")
+            relay_registered = ok
             continue
 
         if packet.get("type") == PUNCH_MAGIC:
@@ -448,7 +460,8 @@ def run_client(args: argparse.Namespace) -> int:
 
     sock.close()
     log(
-        f"FAIL: no pong within {args.timeout}s (punch_rx={punch_rx}, relay_rx={relay_rx}, ping_tx={ping_tx}). "
+        f"FAIL: no pong within {args.timeout}s (punch_rx={punch_rx}, relay_registered={relay_registered}, "
+        f"relay_rx={relay_rx}, ping_tx={ping_tx}). "
         "Backend rendezvous succeeded, but UDP data did not complete."
     )
     return 2
