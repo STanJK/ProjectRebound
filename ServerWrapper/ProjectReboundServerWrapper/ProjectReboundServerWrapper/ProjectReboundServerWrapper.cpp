@@ -1,18 +1,36 @@
-﻿#include <windows.h>
-#include <iostream>
+﻿#define NOMINMAX
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <mutex>
+#include <random>
+#include <sstream>
 #include <string>
 #include <thread>
-#include <chrono>
-#include <iomanip>
-#include <filesystem>
-#include <random>
+#include <vector>
+
 #pragma comment(lib, "ws2_32.lib")
 
-
-#define NOMINMAX
+enum class ServerState
+{
+    Stopped,
+    Starting,
+    Running,
+    Stopping,
+    Restarting
+};
 
 HANDLE g_ServerProcess = NULL;
+DWORD g_ServerPid = 0;
 
 const std::string DEFAULT_BACKEND = "ax48735790k.vicp.fun:3000";
 std::string CurrentMap = "Warehouse";
@@ -27,8 +45,19 @@ int g_ExternalPort = g_ServerPort;
 
 bool OfflineMode = false;
 
+// Serializes all lifecycle transitions so input commands and background
+// watcher threads cannot restart/kill/start the process at the same time.
+std::mutex g_ServerMutex;
+std::mutex g_LogMutex;
 std::atomic<bool> ServerRunning = false;
-int g_ConsecutiveFailures = 0;
+std::atomic<bool> g_WrapperShuttingDown = false;
+std::atomic<ServerState> g_ServerState{ ServerState::Stopped };
+// Each launched process gets a generation number. Background threads only act
+// if their captured generation still matches the current server instance.
+std::atomic<uint64_t> g_ServerGeneration{ 0 };
+std::atomic<int> g_ConsecutiveFailures{ 0 };
+std::atomic<uint64_t> g_LastHeartbeatTickMs{ 0 };
+
 std::chrono::steady_clock::time_point g_LastFailureTime;
 const int MAX_FAILURES = 3;
 const auto FAILURE_RESET_WINDOW = std::chrono::minutes(1);
@@ -36,8 +65,53 @@ const auto FAILURE_RESET_WINDOW = std::chrono::minutes(1);
 //Forward Declaration
 void LauncherLog(const std::string& msg);
 void LaunchServer();
+void RestartServer();
+void KillServer();
 
-std::chrono::steady_clock::time_point lastHeartbeatTime;
+bool LaunchServerLocked();
+bool StopServerLocked();
+void RequestRestart(bool rotateMap, const std::string& reason);
+void PipeReader(HANDLE pipe, uint64_t generation);
+void StartWatchdog(HANDLE processHandle, uint64_t generation);
+void StartExitWatcher(HANDLE processHandle, uint64_t generation);
+
+uint64_t SteadyNowMs()
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void ResetHeartbeatClock()
+{
+    g_LastHeartbeatTickMs.store(SteadyNowMs());
+}
+
+bool HasHeartbeatTimedOut(std::chrono::seconds timeout)
+{
+    const uint64_t last = g_LastHeartbeatTickMs.load();
+    const uint64_t now = SteadyNowMs();
+    return now > last + static_cast<uint64_t>(timeout.count()) * 1000ULL;
+}
+
+HANDLE DuplicateProcessHandle(HANDLE source)
+{
+    HANDLE duplicated = NULL;
+    if (!DuplicateHandle(
+        GetCurrentProcess(),
+        source,
+        GetCurrentProcess(),
+        &duplicated,
+        0,
+        FALSE,
+        DUPLICATE_SAME_ACCESS))
+    {
+        LauncherLog("DuplicateHandle failed. GetLastError=" + std::to_string(GetLastError()));
+        return NULL;
+    }
+
+    return duplicated;
+}
 
 std::string CurrentTimestamp()
 {
@@ -124,6 +198,8 @@ void PrintMapList()
 
 void SetMap(const std::string& name)
 {
+    std::lock_guard<std::mutex> lock(g_ServerMutex);
+
     for (const auto& m : MapList)
     {
         if (_stricmp(m.name.c_str(), name.c_str()) == 0)
@@ -145,6 +221,8 @@ void SetMap(const std::string& name)
 
 void SetMode(const std::string& mode)
 {
+    std::lock_guard<std::mutex> lock(g_ServerMutex);
+
     if (_stricmp(mode.c_str(), "pvp") == 0)
     {
         CurrentMode = "pvp";
@@ -163,6 +241,8 @@ void SetMode(const std::string& mode)
 
 void SetDifficulty(const std::string& diff)
 {
+    std::lock_guard<std::mutex> lock(g_ServerMutex);
+
     if (_stricmp(diff.c_str(), "easy") == 0)
     {
         CurrentDifficulty = "easy";
@@ -184,40 +264,89 @@ void SetDifficulty(const std::string& diff)
     }
 }
 
+bool StopServerLocked()
+{
+    if (!g_ServerProcess)
+    {
+        g_ServerPid = 0;
+        ServerRunning.store(false);
+        g_ServerState.store(ServerState::Stopped);
+        return true;
+    }
+
+    LauncherLog("Stopping server...");
+    g_ServerState.store(ServerState::Stopping);
+    ServerRunning.store(false);
+
+    // Retire the current instance before we touch the process so older watcher
+    // threads cannot restart or inspect a server that is already being replaced.
+    g_ServerGeneration.fetch_add(1);
+
+    HANDLE process = g_ServerProcess;
+    DWORD exitCode = 0;
+
+    if (GetExitCodeProcess(process, &exitCode) && exitCode == STILL_ACTIVE)
+    {
+        if (!TerminateProcess(process, 0))
+        {
+            LauncherLog("TerminateProcess failed. GetLastError=" + std::to_string(GetLastError()));
+            return false;
+        }
+    }
+
+    const DWORD waitResult = WaitForSingleObject(process, 5000);
+    if (waitResult != WAIT_OBJECT_0)
+    {
+        LauncherLog("ERROR: timed out waiting for server process to exit.");
+        return false;
+    }
+
+    CloseHandle(process);
+    g_ServerProcess = NULL;
+    g_ServerPid = 0;
+    g_ServerState.store(ServerState::Stopped);
+    return true;
+}
+
 void KillServer()
 {
-    if (g_ServerProcess)
-    {
-        LauncherLog("Killing server...");
-        TerminateProcess(g_ServerProcess, 0);
-        CloseHandle(g_ServerProcess);
-        g_ServerProcess = NULL;
-        ServerRunning = false;
-    }
-    else
-    {
-        LauncherLog("No server to kill.");
-        ServerRunning = false;
-    }
+    std::lock_guard<std::mutex> lock(g_ServerMutex);
+    StopServerLocked();
 }
 
 void RestartServer()
 {
-	//Check if mutiple failures happen within the reset window
+    RequestRestart(false, "manual restart");
+}
+
+void RequestRestart(bool rotateMap, const std::string& reason)
+{
+    if (g_WrapperShuttingDown.load())
+        return;
+
+    std::lock_guard<std::mutex> lock(g_ServerMutex);
+
+    const ServerState state = g_ServerState.load();
+    if (state == ServerState::Starting ||
+        state == ServerState::Stopping ||
+        state == ServerState::Restarting)
+    {
+        LauncherLog("Restart ignored: server lifecycle transition already in progress.");
+        return;
+    }
+
     auto now = std::chrono::steady_clock::now();
-    if (now - g_LastFailureTime < FAILURE_RESET_WINDOW) {
-        g_ConsecutiveFailures++;
-    }
-    else {
+    if (now - g_LastFailureTime < FAILURE_RESET_WINDOW)
+        ++g_ConsecutiveFailures;
+    else
         g_ConsecutiveFailures = 1;
-    }
     g_LastFailureTime = now;
 
-	// Exceed max failures, stop auto-restart and alert user
-    if (g_ConsecutiveFailures >= MAX_FAILURES) {
-        LauncherLog("CRITICAL: Server failed to start 3 times in 1 minute. Stopping auto-restart.");
+    if (g_ConsecutiveFailures.load() >= MAX_FAILURES)
+    {
+        LauncherLog("CRITICAL: Server failed to restart 3 times in 1 minute. Stopping auto-restart.");
         MessageBoxA(NULL,
-            "Server failed to start repeatedly.\n"
+            "Server failed to restart repeatedly.\n"
             "Possible reasons:\n"
             "- Current port is occupied by another program.\n"
             "- Map file missing or corrupt.\n"
@@ -225,17 +354,28 @@ void RestartServer()
             "Please check the logs and restart the launcher manually.",
             "Project Boundary Server Wrapper",
             MB_OK | MB_ICONERROR);
-        ServerRunning = false;
-        g_ConsecutiveFailures = 0; //reset counter
+        g_ServerState.store(ServerState::Stopped);
+        ServerRunning.store(false);
+        g_ConsecutiveFailures = 0;
         return;
     }
 
-    LauncherLog("Restarting server...");
-    KillServer();
-    Sleep(500);
-    LaunchServer();
-}
+    g_ServerState.store(ServerState::Restarting);
+    LauncherLog("Restarting server (" + reason + ")...");
 
+    if (rotateMap)
+    {
+        LastMap = CurrentMap;
+        CurrentMap = PickRandomMapAvoidingLast();
+        LauncherLog("Auto-rotating map to: " + CurrentMap);
+    }
+
+    if (!StopServerLocked())
+        return;
+
+    if (!LaunchServerLocked())
+        LauncherLog("ERROR: restart failed.");
+}
 
 void InputThread()
 {
@@ -266,33 +406,37 @@ void InputThread()
         }
         else if (cmd.rfind("difficulty ", 0) == 0)
         {
-            std::string diff = cmd.substr(11);
-            SetDifficulty(diff);
+            SetDifficulty(cmd.substr(11));
         }
         else if (cmd == "online")
         {
+            std::lock_guard<std::mutex> lock(g_ServerMutex);
             OnlineBackend = DEFAULT_BACKEND;
             OfflineMode = false;
             LauncherLog("Online mode enabled. Backend = " + OnlineBackend);
         }
         else if (cmd.rfind("online ", 0) == 0)
         {
+            std::lock_guard<std::mutex> lock(g_ServerMutex);
             OnlineBackend = cmd.substr(7);
             OfflineMode = false;
             LauncherLog("Online mode enabled. Backend = " + OnlineBackend);
         }
         else if (cmd == "offline")
         {
+            std::lock_guard<std::mutex> lock(g_ServerMutex);
             OfflineMode = true;
             LauncherLog("Offline mode enabled. Server will not contact backend.");
         }
         else if (cmd.rfind("servername ", 0) == 0)
         {
+            std::lock_guard<std::mutex> lock(g_ServerMutex);
             ServerName = cmd.substr(11);
             LauncherLog("Server name set to: " + ServerName);
         }
         else if (cmd.rfind("serverregion ", 0) == 0)
         {
+            std::lock_guard<std::mutex> lock(g_ServerMutex);
             ServerRegion = cmd.substr(13);
             LauncherLog("Server region set to: " + ServerRegion);
         }
@@ -302,9 +446,10 @@ void InputThread()
             try {
                 int newPort = std::stoi(portStr);
                 if (newPort < 1 || newPort > 65535) {
-                    LauncherLog("Invalid port. Must be 1–65535.");
+                    LauncherLog("Invalid port. Must be 1-65535.");
                 }
                 else {
+                    std::lock_guard<std::mutex> lock(g_ServerMutex);
                     g_ServerPort = newPort;
                     LauncherLog("Server port set to: " + std::to_string(g_ServerPort));
                 }
@@ -319,9 +464,10 @@ void InputThread()
             try {
                 int newPort = std::stoi(portStr);
                 if (newPort < 1 || newPort > 65535) {
-                    LauncherLog("Invalid external port. Must be 1–65535.");
+                    LauncherLog("Invalid external port. Must be 1-65535.");
                 }
                 else {
+                    std::lock_guard<std::mutex> lock(g_ServerMutex);
                     g_ExternalPort = newPort;
                     LauncherLog("External port set to: " + std::to_string(g_ExternalPort));
                 }
@@ -348,19 +494,17 @@ std::string PickRandom(const std::vector<std::string>& list)
 void LauncherLog(const std::string& msg)
 {
     std::string line = "[Launcher] " + msg;
+    std::lock_guard<std::mutex> lock(g_LogMutex);
 
-    // Write to log file
     logFile << line << std::endl;
     logFile.flush();
-
-    // Write to console
     std::cout << line << std::endl;
 }
 
-void PipeReader(HANDLE pipe)
+void PipeReader(HANDLE pipe, uint64_t generation)
 {
     char buffer[4096];
-    DWORD bytesRead;
+    DWORD bytesRead = 0;
 
     while (true)
     {
@@ -368,25 +512,24 @@ void PipeReader(HANDLE pipe)
             break;
 
         buffer[bytesRead] = '\0';
-
         std::string msg(buffer);
 
-        // Detect heartbeat
-        if (msg.find("[HEARTBEAT]") != std::string::npos) {
-            lastHeartbeatTime = std::chrono::steady_clock::now();
-			g_ConsecutiveFailures = 0;  //Clear counter on successful heartbeat
+        // Ignore heartbeats from stale process generations that may still be draining output during a restart.
+        if (msg.find("[HEARTBEAT]") != std::string::npos && generation == g_ServerGeneration.load())
+        {
+            ResetHeartbeatClock();
+            g_ConsecutiveFailures = 0;
             LauncherLog("Heartbeat received");
         }
 
-        // Write raw game output
+        std::lock_guard<std::mutex> lock(g_LogMutex);
         logFile << msg;
         logFile.flush();
-
-        // Also print to wrapper console
         std::cout << msg;
     }
+
+    CloseHandle(pipe);
     LauncherLog("PipeReader thread ended.");
-    ServerRunning = false;
 }
 
 void HideGameWindow(DWORD pid)
@@ -408,49 +551,66 @@ void HideGameWindow(DWORD pid)
 
 BOOL WINAPI ConsoleHandler(DWORD ctrlType)
 {
-    // Kill the server if wrapper is closing
-    if (g_ServerProcess)
-    {
-        TerminateProcess(g_ServerProcess, 0);
-    }
+    (void)ctrlType;
+    g_WrapperShuttingDown.store(true);
+
+    std::lock_guard<std::mutex> lock(g_ServerMutex);
+    StopServerLocked();
 
     return FALSE; // allow normal Ctrl+C behavior
 }
 
-void StartWatchdog()
+void StartWatchdog(HANDLE processHandle, uint64_t generation)
 {
-    std::thread([]() {
+    std::thread([processHandle, generation]() {
         const auto timeout = std::chrono::seconds(60);
 
-        while (ServerRunning)
+        while (true)
         {
+            if (g_WrapperShuttingDown.load())
+                break;
+
+            if (generation != g_ServerGeneration.load())
+                break;
+
+            if (g_ServerState.load() != ServerState::Running)
+                break;
+
             DWORD code = 0;
-            GetExitCodeProcess(g_ServerProcess, &code);
+            if (!GetExitCodeProcess(processHandle, &code) || code != STILL_ACTIVE)
+                break;
 
-            // If process is dead, exit watcher will restart it
-            if (code != STILL_ACTIVE)
+            if (HasHeartbeatTimedOut(timeout))
             {
-                LauncherLog("Watchdog: server exited, skipping timeout restart.");
-                return;
-            }
-
-            auto now = std::chrono::steady_clock::now();
-
-            if (now - lastHeartbeatTime > timeout)
-            {
-                LauncherLog("Heartbeat timeout — server frozen.");
-
-                LastMap = CurrentMap;
-                CurrentMap = PickRandomMapAvoidingLast();
-
-                LauncherLog("Auto-rotating map to: " + CurrentMap);
-
-                RestartServer();
-                return;
+                LauncherLog("Heartbeat timeout - server frozen.");
+                RequestRestart(true, "heartbeat timeout");
+                break;
             }
 
             Sleep(1000);
         }
+
+        CloseHandle(processHandle);
+        }).detach();
+}
+
+void StartExitWatcher(HANDLE processHandle, uint64_t generation)
+{
+    std::thread([processHandle, generation]() {
+        WaitForSingleObject(processHandle, INFINITE);
+        CloseHandle(processHandle);
+
+        if (g_WrapperShuttingDown.load())
+            return;
+
+        if (generation != g_ServerGeneration.load())
+            return;
+
+        if (g_ServerState.load() != ServerState::Running)
+            return;
+
+        LauncherLog("Server exited unexpectedly.");
+        RequestRestart(true, "process exit");
         }).detach();
 }
 
@@ -480,22 +640,49 @@ bool IsPortAvailable(int port, bool useTCP = false)
     return result != SOCKET_ERROR;
 }
 
-void LaunchServer()
+bool LaunchServerLocked()
 {
+    if (g_WrapperShuttingDown.load())
+        return false;
+
+    const ServerState state = g_ServerState.load();
+    if (state == ServerState::Starting || state == ServerState::Running)
+    {
+        LauncherLog("Launch ignored: server is already starting or running.");
+        return false;
+    }
+
     int serverPort = g_ServerPort;
     if (!IsPortAvailable(serverPort)) {
         LauncherLog("ERROR: UDP Port " + std::to_string(serverPort) + " is already in use!");
-        return;
+        g_ServerState.store(ServerState::Stopped);
+        ServerRunning.store(false);
+        return false;
     }
-    LastMap = CurrentMap;
+
+    g_ServerState.store(ServerState::Starting);
+    ServerRunning.store(false);
     LauncherLog("Launching server process...");
 
-    // Create pipes
     SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
-    HANDLE readPipe, writePipe;
+    HANDLE readPipe = NULL;
+    HANDLE writePipe = NULL;
 
-    CreatePipe(&readPipe, &writePipe, &sa, 0);
-    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+    if (!CreatePipe(&readPipe, &writePipe, &sa, 0))
+    {
+        LauncherLog("CreatePipe failed. GetLastError=" + std::to_string(GetLastError()));
+        g_ServerState.store(ServerState::Stopped);
+        return false;
+    }
+
+    if (!SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0))
+    {
+        LauncherLog("SetHandleInformation failed. GetLastError=" + std::to_string(GetLastError()));
+        CloseHandle(readPipe);
+        CloseHandle(writePipe);
+        g_ServerState.store(ServerState::Stopped);
+        return false;
+    }
 
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -505,7 +692,6 @@ void LaunchServer()
 
     PROCESS_INFORMATION pi{};
 
-    // Build mode path
     std::string modePath;
 
     if (CurrentMode == "pve")
@@ -522,7 +708,6 @@ void LaunchServer()
         modePath = "/Game/Online/GameMode/PBGameMode_Rush_BP.PBGameMode_Rush_BP_C";
     }
 
-    // Build command line
     std::wstring cmd =
         L".\\ProjectBoundarySteam-Win64-Shipping.exe "
         L"-log -server -nullrhi "
@@ -532,14 +717,12 @@ void LaunchServer()
         L"-external=" + std::to_wstring(g_ExternalPort) + L" "
         + (CurrentMode == "pve" ? L"-pve " : L"");
 
-    // Add server name
     std::wstring wName(ServerName.begin(), ServerName.end());
     cmd += L"-servername=" + wName + L" ";
 
-    // Add server region
     std::wstring wRegion(ServerRegion.begin(), ServerRegion.end());
     cmd += L"-serverregion=" + wRegion + L" ";
-    // Add Backend server
+
     if (!OfflineMode && !OnlineBackend.empty())
     {
         std::wstring wOnline(OnlineBackend.begin(), OnlineBackend.end());
@@ -558,51 +741,48 @@ void LaunchServer()
         &si,
         &pi))
     {
-        LauncherLog("Failed to launch server!");
-        return;
+        LauncherLog("Failed to launch server! GetLastError=" + std::to_string(GetLastError()));
+        CloseHandle(readPipe);
+        CloseHandle(writePipe);
+        g_ServerState.store(ServerState::Stopped);
+        return false;
     }
 
-    g_ServerProcess = pi.hProcess;
     CloseHandle(writePipe);
+    CloseHandle(pi.hThread);
 
-    // Pipe reader
-    std::thread reader(PipeReader, readPipe);
-    reader.detach();
+    g_ServerProcess = pi.hProcess;
+    g_ServerPid = pi.dwProcessId;
+
+    // Publish the new generation before creating watcher threads so stale
+    // threads can detect they no longer belong to the active process.
+    const uint64_t generation = g_ServerGeneration.fetch_add(1) + 1;
+    ResetHeartbeatClock();
+
+    ServerRunning.store(true);
+    g_ServerState.store(ServerState::Running);
+
+    std::thread(PipeReader, readPipe, generation).detach();
+
+    HANDLE watchdogHandle = DuplicateProcessHandle(pi.hProcess);
+    if (watchdogHandle)
+        StartWatchdog(watchdogHandle, generation);
+
+    HANDLE exitWatcherHandle = DuplicateProcessHandle(pi.hProcess);
+    if (exitWatcherHandle)
+        StartExitWatcher(exitWatcherHandle, generation);
 
     LauncherLog("Server launched. PID = " + std::to_string(pi.dwProcessId));
 
-    Sleep(500);
-
-
-    // Exit watcher
-    std::thread([=]() {
-        while (true)
-        {
-            DWORD code = 0;
-            if (!GetExitCodeProcess(g_ServerProcess, &code))
-                break;
-
-            if (code != STILL_ACTIVE)
-            {
-                LauncherLog("Server exited — rotating map.");
-
-                ServerRunning = false;
-
-                LastMap = CurrentMap;
-                CurrentMap = PickRandomMapAvoidingLast();
-
-                RestartServer();
-                return;
-            }
-
-            Sleep(1000);
-        }
-        }).detach();
-
     HideGameWindow(pi.dwProcessId);
     LauncherLog("Server window hidden.");
-    ServerRunning = true;
-    StartWatchdog();
+    return true;
+}
+
+void LaunchServer()
+{
+    std::lock_guard<std::mutex> lock(g_ServerMutex);
+    LaunchServerLocked();
 }
 
 int main()
@@ -617,7 +797,7 @@ int main()
     }
     // default external = server port
     g_ExternalPort = g_ServerPort;
-    lastHeartbeatTime = std::chrono::steady_clock::now();
+    ResetHeartbeatClock();
     SetConsoleCtrlHandler(ConsoleHandler, TRUE);
 
     // Create logs folder
