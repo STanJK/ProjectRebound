@@ -9,6 +9,8 @@
 #include <windows.h>
 
 #include <atomic>
+#include <array>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -19,7 +21,9 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 #include <functional>
 #include "json.hpp"
@@ -90,12 +94,26 @@ struct Command
 };
 
 std::vector<Command> g_Commands;
+std::unordered_map<std::string, size_t> g_CommandIndex;
+
+std::string NormalizeKey(std::string_view value)
+{
+    std::string normalized;
+    normalized.reserve(value.size());
+
+    for (unsigned char ch : value)
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+
+    return normalized;
+}
 
 void RegisterCommand(const std::string& name,
     const std::string& help,
     std::function<void(const std::string&)> handler)
 {
-    g_Commands.push_back({ name, help, handler });
+    const size_t index = g_Commands.size();
+    g_Commands.push_back({ name, help, std::move(handler) });
+    g_CommandIndex.emplace(g_Commands.back().name, index);
 }
 
 // ======================================================
@@ -155,26 +173,35 @@ std::string CurrentTimestamp()
 
 std::ofstream logFile;
 
+const char* ServerStateToString(ServerState state)
+{
+    switch (state)
+    {
+    case ServerState::Running:
+        return "Running";
+    case ServerState::Starting:
+        return "Starting";
+    case ServerState::Stopping:
+        return "Stopping";
+    case ServerState::Restarting:
+        return "Restarting";
+    case ServerState::Stopped:
+    default:
+        return "Stopped";
+    }
+}
+
 
 // ======================================================
 //  MAP LISTS AND MAP LOGIC
 // ======================================================
 
-std::vector<std::string> Maps = {
-    "CircularX", "DataCenter", "Dusty", "GangesRiver", "Oriolus",
-    "RelayStation", "Warehouse", "MiniFarm", "Museum", "OSS"
-};
-
-std::vector<std::string> PvEMaps = {
-    "CircularX", "DataCenter", "Warehouse", "MiniFarm", "OSS"
-};
-
 struct MapInfo {
-    std::string name;
+    std::string_view name;
     bool pveBug;
 };
 
-std::vector<MapInfo> MapList = {
+const std::array<MapInfo, 11> MapList = {
     {"OSS", false},
     {"MiniFarm", false},
     {"Warehouse", false},
@@ -188,23 +215,39 @@ std::vector<MapInfo> MapList = {
     {"GangesRiver", true}
 };
 
+std::unordered_map<std::string, size_t> BuildMapLookup()
+{
+    std::unordered_map<std::string, size_t> lookup;
+    lookup.reserve(MapList.size());
+
+    for (size_t index = 0; index < MapList.size(); ++index)
+        lookup.emplace(NormalizeKey(MapList[index].name), index);
+
+    return lookup;
+}
+
+const std::unordered_map<std::string, size_t> g_MapLookup = BuildMapLookup();
+
 std::string PickRandomMapAvoidingLast()
 {
-    std::vector<std::string> candidates;
+    static std::mt19937 rng(std::random_device{}());
+    size_t eligibleCount = 0;
+    std::string selected = LastMap;
 
     for (const auto& m : MapList)
     {
-        if (!m.pveBug && m.name != LastMap)
-            candidates.push_back(m.name);
+        if (m.pveBug || m.name == LastMap)
+            continue;
+
+        ++eligibleCount;
+        if (std::uniform_int_distribution<size_t>(1, eligibleCount)(rng) == 1)
+            selected.assign(m.name);
     }
 
-    if (candidates.empty())
+    if (eligibleCount == 0)
         return LastMap;
 
-    static std::mt19937 rng(std::random_device{}());
-    std::uniform_int_distribution<> dist(0, candidates.size() - 1);
-
-    return candidates[dist(rng)];
+    return selected;
 }
 
 void PrintMapList()
@@ -231,23 +274,22 @@ void SetMap(const std::string& name)
 {
     std::lock_guard<std::mutex> lock(g_ServerMutex);
 
-    for (const auto& m : MapList)
+    const auto it = g_MapLookup.find(NormalizeKey(name));
+    if (it == g_MapLookup.end())
     {
-        if (_stricmp(m.name.c_str(), name.c_str()) == 0)
-        {
-            if (m.pveBug)
-            {
-                LauncherLog("Map '" + name + "' is forbidden due to PVE bug.");
-                return;
-            }
-
-            CurrentMap = m.name;
-            LauncherLog("Map set to: " + CurrentMap);
-            return;
-        }
+        LauncherLog("Unknown map: " + name);
+        return;
     }
 
-    LauncherLog("Unknown map: " + name);
+    const MapInfo& map = MapList[it->second];
+    if (map.pveBug)
+    {
+        LauncherLog("Map '" + name + "' is forbidden due to PVE bug.");
+        return;
+    }
+
+    CurrentMap.assign(map.name);
+    LauncherLog("Map set to: " + CurrentMap);
 }
 
 void SetMode(const std::string& mode)
@@ -297,6 +339,9 @@ void SetDifficulty(const std::string& diff)
 
 void InitCommands()
 {
+    g_Commands.reserve(16);
+    g_CommandIndex.reserve(16);
+
     RegisterCommand("maplist", "Show all maps", [](const std::string& args) {
         PrintMapList();
         });
@@ -394,6 +439,7 @@ void InitCommands()
         });
 
     RegisterCommand("status", "Show current server status", [](const std::string& args) {
+        const ServerState state = g_ServerState.load();
         LauncherLog("=== Server Status ===");
         LauncherLog("Map: " + CurrentMap);
         LauncherLog("Mode: " + CurrentMode);
@@ -403,13 +449,7 @@ void InitCommands()
         LauncherLog("Port: " + std::to_string(g_ServerPort));
         LauncherLog("External Port: " + std::to_string(g_ExternalPort));
         LauncherLog("Backend: " + (OfflineMode ? "Offline" : OnlineBackend));
-        LauncherLog("State: " + std::string(
-            g_ServerState.load() == ServerState::Running ? "Running" :
-            g_ServerState.load() == ServerState::Starting ? "Starting" :
-            g_ServerState.load() == ServerState::Stopping ? "Stopping" :
-            g_ServerState.load() == ServerState::Restarting ? "Restarting" :
-            "Stopped"
-        ));
+        LauncherLog("State: " + std::string(ServerStateToString(state)));
         });
 
     RegisterCommand("help", "Show all commands", [](const std::string& args) {
@@ -441,19 +481,14 @@ void InputThread()
             args = line.substr(space + 1);
         }
 
-        bool found = false;
-        for (auto& c : g_Commands)
+        const auto commandIt = g_CommandIndex.find(cmd);
+        if (commandIt != g_CommandIndex.end())
         {
-            if (c.name == cmd)
-            {
-                c.handler(args);
-                found = true;
-                break;
-            }
+            g_Commands[commandIt->second].handler(args);
+            continue;
         }
 
-        if (!found)
-            LauncherLog("Unknown command. Type 'help' for list.");
+        LauncherLog("Unknown command. Type 'help' for list.");
     }
 }
 
