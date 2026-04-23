@@ -208,19 +208,20 @@ struct MapInfo {
     bool pveBug;
 };
 
-const std::array<MapInfo, 11> MapList = {
-    {"OSS", false},
-    {"MiniFarm", false},
-    {"Warehouse", false},
-    {"Dusty", true},
-    {"DataCenter", false},
-    {"CircularX", false},
-    {"Interior_C", true},
-    {"Museum_art", true},
-    {"RelayStation", true},
-    {"Oriolus", true},
-    {"GangesRiver", true}
-};
+const std::array<MapInfo, 11> MapList{ {
+    { "OSS",         false },
+    { "MiniFarm",    false },
+    { "Warehouse",   false },
+    { "Dusty",       true  },
+    { "DataCenter",  false },
+    { "CircularX",   false },
+    { "Interior_C",  true  },
+    { "Museum_art",  true  },
+    { "RelayStation",true  },
+    { "Oriolus",     true  },
+    { "GangesRiver", true  }
+} };
+
 
 std::unordered_map<std::string, size_t> BuildMapLookup()
 {
@@ -892,8 +893,8 @@ bool LaunchServerLocked()
     ServerRunning.store(false);
     LauncherLog("Launching server process...");
     HeartbeatSeen = false;
-    lastHeartbeatTime = std::chrono::steady_clock::now();
-    g_ServerLaunchTime = lastHeartbeatTime;
+    ResetHeartbeatClock();  // updates g_LastHeartbeatTickMs
+    g_ServerLaunchTime = std::chrono::steady_clock::now();
 
     SECURITY_ATTRIBUTES sa{ sizeof(SECURITY_ATTRIBUTES), NULL, TRUE };
     HANDLE readPipe = NULL;
