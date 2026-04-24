@@ -93,59 +93,47 @@ void StartExitWatcher(HANDLE processHandle, uint64_t generation);
 void SaveConfigFile();
 bool LoadConfigFile();
 
-struct Command
+// ======================================================
+//  LOGGING SYSTEM
+// ======================================================
+
+std::ofstream logFile;
+
+void LauncherLog(const std::string& msg)
 {
-    std::string name;
-    std::string help;
-    std::function<void(const std::string& args)> handler;
-};
+    std::string line = "[Launcher] " + msg;
+    std::lock_guard<std::mutex> lock(g_LogMutex);
 
-std::vector<Command> g_Commands;
-std::unordered_map<std::string, size_t> g_CommandIndex;
-
-std::string NormalizeKey(std::string_view value)
-{
-    std::string normalized;
-    normalized.reserve(value.size());
-
-    for (unsigned char ch : value)
-        normalized.push_back(static_cast<char>(std::tolower(ch)));
-
-    return normalized;
-}
-
-void RegisterCommand(const std::string& name,
-    const std::string& help,
-    std::function<void(const std::string&)> handler)
-{
-    const size_t index = g_Commands.size();
-    g_Commands.push_back({ name, help, std::move(handler) });
-    g_CommandIndex.emplace(g_Commands.back().name, index);
+    logFile << line << std::endl;
+    logFile.flush();
+    std::cout << line << std::endl;
 }
 
 // ======================================================
 //  UTILITY FUNCTIONS
 // ======================================================
-
+//Init the steady clock in milliseconds for heartbeat checking
 uint64_t SteadyNowMs()
 {
     return static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
 }
-
+//Sets the LastHeartbeatTick to current time
 void ResetHeartbeatClock()
 {
     g_LastHeartbeatTickMs.store(SteadyNowMs());
 }
 
+//Compare lastheartbeat and now, check if the difference is larger than the given std::chrono::seconds
 bool HasHeartbeatTimedOut(std::chrono::seconds timeout)
 {
     const uint64_t last = g_LastHeartbeatTickMs.load();
     const uint64_t now = SteadyNowMs();
-    return now > last + static_cast<uint64_t>(timeout.count()) * 1000ULL;
+    return now > last + static_cast<uint64_t>(timeout.count()) * 1000ULL; //Operate the time in 64bit ULL
 }
 
+//Function to Dupe importante watchdog handles into the current process so they aer protected
 HANDLE DuplicateProcessHandle(HANDLE source)
 {
     HANDLE duplicated = NULL;
@@ -165,6 +153,7 @@ HANDLE DuplicateProcessHandle(HANDLE source)
     return duplicated;
 }
 
+//Gets the current timestamp in the format of YYYYMMDD_HHMMSS for log file naming
 std::string CurrentTimestamp()
 {
     auto now = std::chrono::system_clock::now();
@@ -178,8 +167,8 @@ std::string CurrentTimestamp()
     return oss.str();
 }
 
-std::ofstream logFile;
 
+// Converts ServerState enum to string for logging purposes
 const char* ServerStateToString(ServerState state)
 {
     switch (state)
@@ -200,14 +189,54 @@ const char* ServerStateToString(ServerState state)
 
 
 // ======================================================
+//  CONSOLE COMMAND SYSTEM
+// ======================================================
+
+// Struct the command structure with name and it's function handler
+struct Command
+{
+    std::string name;
+    std::string help;
+    std::function<void(const std::string& args)> handler;
+};
+
+//Init the command lookup table
+std::vector<Command> g_Commands;
+std::unordered_map<std::string, size_t> g_CommandIndex;
+
+//Register commands and build the command lookup table
+void RegisterCommand(const std::string& name,
+    const std::string& help,
+    std::function<void(const std::string&)> handler)
+{
+    const size_t index = g_Commands.size();
+    g_Commands.push_back({ name, help, std::move(handler) });
+    g_CommandIndex.emplace(g_Commands.back().name, index);
+}
+
+//Function used to normalize the mapnames so the map lookup and map commands became non-case-sensitive
+std::string NormalizeKey(std::string_view value)
+{
+    std::string normalized;
+    normalized.reserve(value.size());
+
+    for (unsigned char ch : value)
+        normalized.push_back(static_cast<char>(std::tolower(ch)));
+
+    return normalized;
+}
+
+// ======================================================
 //  MAP LISTS AND MAP LOGIC
 // ======================================================
 
+// Define the map information structure
 struct MapInfo {
     std::string_view name;
     bool pveBug;
 };
 
+// List of maps with their PVE bug status
 const std::array<MapInfo, 11> MapList{ {
     { "OSS",         false },
     { "MiniFarm",    false },
@@ -222,20 +251,20 @@ const std::array<MapInfo, 11> MapList{ {
     { "GangesRiver", true  }
 } };
 
-
+//Creates the actuall index hash map of the maplist, and making all keys normalized for non-case-sensitive lookup
 std::unordered_map<std::string, size_t> BuildMapLookup()
 {
-    std::unordered_map<std::string, size_t> lookup;
-    lookup.reserve(MapList.size());
-
+    std::unordered_map<std::string, size_t> lookup; //create hashmap
+    lookup.reserve(MapList.size()); //Pre‑allocates memory of the list size
+    //lookthrough and normalize
     for (size_t index = 0; index < MapList.size(); ++index)
         lookup.emplace(NormalizeKey(MapList[index].name), index);
 
     return lookup;
 }
+const std::unordered_map<std::string, size_t> g_MapLookup = BuildMapLookup(); //define then call
 
-const std::unordered_map<std::string, size_t> g_MapLookup = BuildMapLookup();
-
+//Picks a random map from the map list, but avoid picking the last played map to prevent back-to-back same map rotation. If all maps are ineligible, returns the last map used
 std::string PickRandomMapAvoidingLast()
 {
     static std::mt19937 rng(std::random_device{}());
@@ -257,7 +286,7 @@ std::string PickRandomMapAvoidingLast()
 
     return selected;
 }
-
+// For the listmap command
 void PrintMapList()
 {
     LauncherLog("=== Available Maps ===");
@@ -501,17 +530,77 @@ void InputThread()
 }
 
 // ======================================================
-//  LOGGING SYSTEM
+//  BUILD STARTUP COMMNADLINE
 // ======================================================
 
-void LauncherLog(const std::string& msg)
+std::string GetCmdValue(const std::string& key)
 {
-    std::string line = "[Launcher] " + msg;
-    std::lock_guard<std::mutex> lock(g_LogMutex);
+    std::string cmd = GetCommandLineA();
+    size_t pos = cmd.find(key);
+    if (pos == std::string::npos)
+        return "";
 
-    logFile << line << std::endl;
-    logFile.flush();
-    std::cout << line << std::endl;
+    pos += key.length();
+    size_t end = cmd.find(" ", pos);
+    if (end == std::string::npos)
+        end = cmd.length();
+
+    return cmd.substr(pos, end - pos);
+}
+
+void LoadCommandLineConfig()
+{
+    std::string portArg = GetCmdValue("-port=");
+    if (!portArg.empty())
+        g_ServerPort = std::stoi(portArg);
+
+    g_ExternalPort = g_ServerPort;
+
+    std::string mapArg = GetCmdValue("-map=");
+    if (!mapArg.empty())
+        SetMap(mapArg);
+
+    std::string modeArg = GetCmdValue("-mode=");
+    if (!modeArg.empty())
+    {
+        if (modeArg.find("PVE") != std::string::npos || modeArg.find("pve") != std::string::npos)
+            SetMode("pve");
+        else if (modeArg.find("PVP") != std::string::npos || modeArg.find("pvp") != std::string::npos)
+            SetMode("pvp");
+        else
+            SetMode(modeArg);
+    }
+
+    std::string difficultyArg = GetCmdValue("-difficulty=");
+    if (!difficultyArg.empty())
+        SetDifficulty(difficultyArg);
+
+    std::string serverNameArg = GetCmdValue("-servername=");
+    if (!serverNameArg.empty())
+        ServerName = serverNameArg;
+
+    std::string serverRegionArg = GetCmdValue("-serverregion=");
+    if (!serverRegionArg.empty())
+        ServerRegion = serverRegionArg;
+
+    std::string onlineArg = GetCmdValue("-online=");
+    if (!onlineArg.empty())
+    {
+        OnlineBackend = onlineArg;
+        OfflineMode = false;
+    }
+
+    std::string roomIdArg = GetCmdValue("-roomid=");
+    if (!roomIdArg.empty())
+        HostRoomId = roomIdArg;
+
+    std::string hostTokenArg = GetCmdValue("-hosttoken=");
+    if (!hostTokenArg.empty())
+        HostToken = hostTokenArg;
+
+    std::string gameExeArg = GetCmdValue("-gameexe=");
+    if (!gameExeArg.empty())
+        GameExePath = gameExeArg;
 }
 
 // ======================================================
@@ -595,8 +684,6 @@ void SaveConfigFile()
 
     LauncherLog("Saved configuration to serverconfig.json");
 }
-
-
 // ======================================================
 //  SERVER LIFECYCLE
 // ======================================================
@@ -1072,73 +1159,3 @@ int main()
         Sleep(1000);
     }
 }
-std::string GetCmdValue(const std::string& key)
-{
-    std::string cmd = GetCommandLineA();
-    size_t pos = cmd.find(key);
-    if (pos == std::string::npos)
-        return "";
-
-    pos += key.length();
-    size_t end = cmd.find(" ", pos);
-    if (end == std::string::npos)
-        end = cmd.length();
-
-    return cmd.substr(pos, end - pos);
-}
-
-void LoadCommandLineConfig()
-{
-    std::string portArg = GetCmdValue("-port=");
-    if (!portArg.empty())
-        g_ServerPort = std::stoi(portArg);
-
-    g_ExternalPort = g_ServerPort;
-
-    std::string mapArg = GetCmdValue("-map=");
-    if (!mapArg.empty())
-        SetMap(mapArg);
-
-    std::string modeArg = GetCmdValue("-mode=");
-    if (!modeArg.empty())
-    {
-        if (modeArg.find("PVE") != std::string::npos || modeArg.find("pve") != std::string::npos)
-            SetMode("pve");
-        else if (modeArg.find("PVP") != std::string::npos || modeArg.find("pvp") != std::string::npos)
-            SetMode("pvp");
-        else
-            SetMode(modeArg);
-    }
-
-    std::string difficultyArg = GetCmdValue("-difficulty=");
-    if (!difficultyArg.empty())
-        SetDifficulty(difficultyArg);
-
-    std::string serverNameArg = GetCmdValue("-servername=");
-    if (!serverNameArg.empty())
-        ServerName = serverNameArg;
-
-    std::string serverRegionArg = GetCmdValue("-serverregion=");
-    if (!serverRegionArg.empty())
-        ServerRegion = serverRegionArg;
-
-    std::string onlineArg = GetCmdValue("-online=");
-    if (!onlineArg.empty())
-    {
-        OnlineBackend = onlineArg;
-        OfflineMode = false;
-    }
-
-    std::string roomIdArg = GetCmdValue("-roomid=");
-    if (!roomIdArg.empty())
-        HostRoomId = roomIdArg;
-
-    std::string hostTokenArg = GetCmdValue("-hosttoken=");
-    if (!hostTokenArg.empty())
-        HostToken = hostTokenArg;
-
-    std::string gameExeArg = GetCmdValue("-gameexe=");
-    if (!gameExeArg.empty())
-        GameExePath = gameExeArg;
-}
-
