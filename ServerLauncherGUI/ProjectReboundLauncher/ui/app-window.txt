@@ -1,0 +1,42 @@
+import { TextEdit, LineEdit, Button, VerticalBox, HorizontalBox, GroupBox } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    width: 800px;
+    height: 600px;
+
+    in-out property <string> console_text;
+    callback send_command(string);
+
+    VerticalBox {
+        spacing: 8px;
+
+        GroupBox {
+            title: "Console Output";
+            height: 450px;
+
+            output := TextEdit {
+                text: root.console_text;
+                read-only: true;
+                wrap: no-wrap;
+            }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            height: 40px;
+
+            input := LineEdit {
+                placeholder-text: "Enter command...";
+            }
+
+            Button {
+                text: "Send";
+                clicked => {
+                    root.send_command(input.text);
+                    input.text = "";
+                }
+            }
+        }
+    }
+}
+

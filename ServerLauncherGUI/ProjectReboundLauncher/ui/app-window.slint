@@ -1,0 +1,81 @@
+// Main application window
+import { TextEdit, LineEdit, Button, VerticalBox, HorizontalBox, GroupBox, Switch } from "std-widgets.slint";
+
+export component AppWindow inherits Window {
+    width: 800px;
+    height: 600px;
+
+    in-out property <string> console_text;
+    callback send_command(string);
+    callback get-new-log() -> string;
+    callback get-log-length() -> int;
+    callback start_server();
+
+    // Auto-scroll toggle (default on)
+    in-out property <bool> auto-scroll: true;
+
+    Timer {
+        interval: 200ms;
+        running: true;
+        triggered => {
+            root.console_text = get-new-log();
+            if root.auto-scroll {
+                let text-len: int = get-log-length();
+                output.set-selection-offsets(text-len, text-len);
+            }
+        }
+    }
+
+    VerticalBox {
+        spacing: 8px;
+
+        GroupBox {
+            title: "Console Output";
+            height: 450px;
+
+            output := TextEdit {
+                text: root.console_text;
+                read-only: true;
+                wrap: word-wrap;
+            }
+        }
+
+        HorizontalBox {
+            spacing: 8px;
+            height: 40px;
+
+            input := LineEdit {
+                placeholder-text: "Enter command...";
+                // Trigger send when Enter is pressed
+                accepted => {
+                    root.send_command(input.text);
+                    input.text = "";
+                }
+            }
+
+            Button {
+                text: "Send";
+                clicked => {
+                    root.send_command(input.text);
+                    input.text = "";
+                }
+            }
+
+            Button {
+                text: "Start Server";
+                clicked => {
+                    root.start_server();
+                }
+            }
+
+            // Auto-scroll toggle switch
+            switch := Switch {
+                text: "Auto-scroll";
+                checked: root.auto-scroll;
+                toggled => {
+                    root.auto-scroll = !root.auto-scroll;
+                }
+            }
+        }
+    }
+}
