@@ -1,4 +1,4 @@
-// ======================================================
+﻿// ======================================================
 //  LateJoinManager — 中途加入（Mid-Game Join）实现
 // ======================================================
 //
@@ -72,10 +72,10 @@ bool LateJoinManager::OnProcessEvent(UObject* Object, const std::string& functio
 {
     // ---- CanPlayerSelectRole（PBGameMode 级别）----
     // 中途加入玩家在回合进行中原本无法选择角色，此处强制放行
-    if (functionName.contains("CanPlayerSelectRole"))
+    if (functionName.find("CanPlayerSelectRole") != std::string::npos)
     {
         auto* RoleParms = (Params::PBGameMode_CanPlayerSelectRole*)Parms;
-        if (RoleParms && IsLateJoinPlayer(RoleParms->Player))
+        if (RoleParms && RoleParms->Player && LateJoinPlayers.find(RoleParms->Player) != LateJoinPlayers.end())
         {
             RoleParms->ReturnValue = true;
             return true;    // 已拦截，跳过原始调用
@@ -84,13 +84,13 @@ bool LateJoinManager::OnProcessEvent(UObject* Object, const std::string& functio
 
     // ---- CanSelectRole（PBPlayerController 级别）----
     // 同上，对中途加入玩家强制允许
-    if (functionName.contains("CanSelectRole"))
+    if (functionName.find("CanSelectRole") != std::string::npos)
     {
         APBPlayerController* PBPlayerController = Object && Object->IsA(APBPlayerController::StaticClass())
             ? (APBPlayerController*)Object
             : nullptr;
 
-        if (IsLateJoinPlayer(PBPlayerController))
+        if (PBPlayerController && LateJoinPlayers.find(PBPlayerController) != LateJoinPlayers.end())
         {
             auto* RoleParms = (Params::PBPlayerController_CanSelectRole*)Parms;
             if (RoleParms)
@@ -116,10 +116,13 @@ void LateJoinManager::OnRoleConfirmed(APBPlayerController* PC)
     auto it = LateJoinPlayers.find(PC);
     if (it != LateJoinPlayers.end())
     {
+        const bool bInitialJoin = it->second.bIsInitialJoin;
         it->second.State = ELateJoinState::RoleConfirmed;
         it->second.ElapsedSeconds = 0.0f;
         it->second.SpawnAttempts = 0;
-        std::cout << "[LATEJOIN] Role confirmed; scheduling single-player spawn." << std::endl;
+        std::cout << "[LATEJOIN] Role confirmed; scheduling "
+            << (bInitialJoin ? "initial-join" : "single-player")
+            << " spawn." << std::endl;
     }
 }
 
@@ -158,7 +161,8 @@ void LateJoinManager::Tick(float DeltaTime)
         // ---- Phase 1: 等待角色选择 ----
         if (Info.State == ELateJoinState::PendingRoleSelection)
         {
-            // 延迟 1s 后发送 ClientStart 序列（等待连接稳定）
+            // 初始加入与中途加入统一：
+            // 都通过 ClientStart 序列推进客户端到可选角/可进入比赛的稳定状态。
             if (!Info.ClientStartSent && Info.ElapsedSeconds >= CLIENT_START_DELAY_SEC)
             {
                 SendLateJoinClientStart(PC);
@@ -189,7 +193,6 @@ void LateJoinManager::Tick(float DeltaTime)
                 }
             }
         }
-
         // ---- 终态清理 ----
         if (Info.State == ELateJoinState::TimedOut)
         {
@@ -205,7 +208,19 @@ void LateJoinManager::Tick(float DeltaTime)
 // @brief 查询指定 PC 是否为中途加入玩家
 bool LateJoinManager::IsLateJoinPlayer(APBPlayerController* PC) const
 {
-    return PC && LateJoinPlayers.find(PC) != LateJoinPlayers.end();
+    if (!PC)
+        return false;
+    auto it = LateJoinPlayers.find(PC);
+    return it != LateJoinPlayers.end() && !it->second.bIsInitialJoin;
+}
+
+// @brief 查询指定 PC 是否为初始加入玩家（注册到延迟生成流程但比赛未开始时连接）
+bool LateJoinManager::IsInitialJoinPlayer(APBPlayerController* PC) const
+{
+    if (!PC)
+        return false;
+    auto it = LateJoinPlayers.find(PC);
+    return it != LateJoinPlayers.end() && it->second.bIsInitialJoin;
 }
 
 // @brief 查询中途加入窗口是否开放
@@ -270,6 +285,76 @@ void LateJoinManager::QueueLateJoinPlayer(APBPlayerController* PC)
     std::cout << "[LATEJOIN] Queued player for in-progress join: " << PC->GetFullName() << std::endl;
 }
 
+// @brief 将初始加入玩家注册到与中途加入一致的延迟生成流程。
+//  初始加入同样走 ClientStart 序列 + 角色确认后生成，
+//  统一客户端状态推进并确保武器在角色确认后创建。
+void LateJoinManager::QueueInitialJoinPlayer(AGameMode* GameMode, APBPlayerController* PC)
+{
+    if (!PC)
+        return;
+
+    // 如果引擎已为该玩家创建了默认 Pawn，需要先清理掉，
+    // 否则 LateJoinManager 会误判为"已生成"而不再创建新 Pawn，
+    // 导致武器永远是默认配置。
+    if (PC->Pawn)
+    {
+        std::cout << "[LATEJOIN] Clearing pre-existing pawn for initial join player: "
+            << PC->Pawn->GetFullName() << std::endl;
+        if (IsSpectatorPawn(PC->Pawn))
+        {
+            PC->ExitObserverState();
+        }
+        PC->UnPossess();
+    }
+
+    FLateJoinInfo info{};
+    info.bIsInitialJoin = true;
+    // 与中途加入统一：由状态机发送 ClientStart 序列
+    info.ClientStartSent = false;
+    LateJoinPlayers[PC] = info;
+    // 阻止角色确认前的自动重生（ServerRestartPlayer 拦截会检查此表）
+    // PrepareLateJoinRespawn 会在生成时将其设为 true
+    PlayerRespawnAllowedMap[PC] = false;
+    std::cout << "[LATEJOIN] Queued player for initial join (deferred spawn): "
+        << PC->GetFullName() << std::endl;
+}
+
+// @brief 统一的客户端状态同步入口。
+//  通过参数控制发送哪些 RPC，避免初始加入/中途加入逻辑漂移。
+void LateJoinManager::SyncClientJoinState(APBPlayerController* PC, const FClientSyncOptions& Options)
+{
+    if (!PC)
+        return;
+
+    if (Options.SendStartOnlineGame)
+        PC->ClientStartOnlineGame();
+
+    if (Options.SendMatchHasStarted)
+        PC->ClientMatchHasStarted();
+
+    if (Options.SendRoundHasStarted)
+        PC->ClientRoundHasStarted();
+
+    if (Options.SendNotifyGameStarted)
+        PC->NotifyGameStarted();
+
+    if (Options.SendClientSelectRole)
+        PC->ClientSelectRole();
+
+    if (Options.SendReadyAtStartSpot)
+        PC->ClientReadyAtStartSpot();
+
+    if (Options.SendGotoPlaying)
+        PC->ClientGotoState(UKismetStringLibrary::Conv_StringToName(L"Playing"));
+
+    if (Options.SendRestartAndAcknowledge)
+    {
+        PC->ClientRestart(PC->Pawn);
+        PC->ClientRetryClientRestart(PC->Pawn);
+        PC->ServerAcknowledgePossession(PC->Pawn);
+    }
+}
+
 // @brief 向中途加入客户端发送"比赛已开始"的完整通知序列
 //  模拟正常比赛启动时的 RPC 序列，让客户端 UI 状态追上
 void LateJoinManager::SendLateJoinClientStart(APBPlayerController* PC)
@@ -278,11 +363,13 @@ void LateJoinManager::SendLateJoinClientStart(APBPlayerController* PC)
         return;
 
     std::cout << "[LATEJOIN] Sending in-progress match state and role selection." << std::endl;
-    PC->ClientStartOnlineGame();
-    PC->ClientMatchHasStarted();
-    PC->ClientRoundHasStarted();
-    PC->NotifyGameStarted();
-    PC->ClientSelectRole();
+    FClientSyncOptions options{};
+    options.SendStartOnlineGame = true;
+    options.SendMatchHasStarted = true;
+    options.SendRoundHasStarted = true;
+    options.SendNotifyGameStarted = true;
+    options.SendClientSelectRole = true;
+    SyncClientJoinState(PC, options);
 }
 
 // @brief 准备重生前的清理工作
@@ -342,12 +429,15 @@ void LateJoinManager::FinalizeLateJoinSpawn(APBPlayerController* PC)
 
     // 向客户端发送完整的"已就绪"通知序列
     PC->ForceNetUpdate();
-    PC->ClientReadyAtStartSpot();
-    PC->NotifyGameStarted();
-    PC->ClientGotoState(UKismetStringLibrary::Conv_StringToName(L"Playing"));
-    PC->ClientRestart(PC->Pawn);
-    PC->ClientRetryClientRestart(PC->Pawn);
-    PC->ServerAcknowledgePossession(PC->Pawn);
+    FClientSyncOptions options{};
+    // 与中途加入一致：生成后推送 Playing 相关就绪状态。
+    options.SendMatchHasStarted = true;
+    options.SendRoundHasStarted = true;
+    options.SendNotifyGameStarted = true;
+    options.SendReadyAtStartSpot = true;
+    options.SendGotoPlaying = true;
+    options.SendRestartAndAcknowledge = true;
+    SyncClientJoinState(PC, options);
 
     std::cout << "[LATEJOIN] Finalized playable possession: "
         << PC->Pawn->GetFullName() << std::endl;

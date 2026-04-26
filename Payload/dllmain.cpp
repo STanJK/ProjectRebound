@@ -396,6 +396,10 @@ int NumExpectedPlayers = -1;
 float MatchStartCountdown = -1.0f;
 
 std::unordered_map<APBPlayerController*, bool> PlayerRespawnAllowedMap{};
+std::unordered_set<APBPlayerController*> PlayersConfirmedRole{};
+std::unordered_set<APBPlayerController*> PendingNameUpdatePlayers{};
+std::unordered_set<APBPlayerController*> AppliedNameUpdatePlayers{};
+float PendingNameApplyAccumulator = 0.0f;
 
 // LateJoinManager instance
 // Constructed later in MainThread after dependencies are ready
@@ -425,6 +429,63 @@ bool IsRoundCurrentlyInProgress()
 {
     APBGameState* GameState = GetPBGameState();
     return GameState && GameState->IsRoundInProgress();
+}
+
+void QueuePendingPlayerNameUpdate(APBPlayerController* PlayerController)
+{
+    if (!PlayerController)
+        return;
+
+    if (AppliedNameUpdatePlayers.find(PlayerController) == AppliedNameUpdatePlayers.end())
+    {
+        PendingNameUpdatePlayers.insert(PlayerController);
+    }
+}
+
+void ApplyPendingPlayerNameUpdates(const char* reason)
+{
+    if (PendingNameUpdatePlayers.empty())
+        return;
+
+    UWorld* World = UWorld::GetWorld();
+    if (!World || !World->AuthorityGameMode)
+        return;
+
+    AGameMode* GameMode = (AGameMode*)World->AuthorityGameMode;
+    if (!GameMode)
+        return;
+
+    std::vector<APBPlayerController*> toApply;
+    toApply.reserve(PendingNameUpdatePlayers.size());
+    for (APBPlayerController* playerController : PendingNameUpdatePlayers)
+    {
+        if (playerController)
+            toApply.push_back(playerController);
+    }
+
+    for (APBPlayerController* playerController : toApply)
+    {
+        if (!playerController || !playerController->PlayerState)
+            continue;
+
+        FString playerName = playerController->PlayerState->GetPlayerName();
+        std::string nameStr = playerName.ToString();
+
+        if (nameStr.empty() || nameStr == "UserName")
+            continue;
+
+        GameMode->ChangeName(playerController, playerName, true);
+
+        if (playerController->PBPlayerState)
+        {
+            playerController->PBPlayerState->OnCustomPlayerNameChanged();
+        }
+
+        PendingNameUpdatePlayers.erase(playerController);
+        AppliedNameUpdatePlayers.insert(playerController);
+
+        std::cout << "[NAME] Applied delayed name update(" << reason << "): " << nameStr << std::endl;
+    }
 }
 // ======================================================
 //  SECTION 7 — HOOK DETOURS (ENGINE HOOKS)
@@ -577,6 +638,12 @@ void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
                             PlayerJoinTimerSelectFuck = 5.0f;
 
                             NumExpectedPlayers = NumPlayersJoined;
+                            NumPlayersSelectedRole = 0;
+                            canStartMatch = false;
+                            StartMatchTimer = -1.0f;
+                            PlayersConfirmedRole.clear();
+                            PendingNameUpdatePlayers.clear();
+                            AppliedNameUpdatePlayers.clear();
                         }
                     }
                 }
@@ -693,7 +760,9 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
         APBPlayerController* PBPlayerController = Object && Object->IsA(APBPlayerController::StaticClass())
             ? (APBPlayerController*)Object
             : nullptr;
+        QueuePendingPlayerNameUpdate(PBPlayerController);
 
+        // Late join player: execute original + advance state, skip match-start counting
         if (gLateJoinManager && gLateJoinManager->IsLateJoinPlayer(PBPlayerController)) {
             // Execute original function first
             ProcessEvent.call(Object, Function, Parms);
@@ -702,14 +771,52 @@ void ProcessEventHook(UObject* Object, UFunction* Function, void* Parms) {
             return;
         }
 
-        NumPlayersSelectedRole++;
+        // Initial join player in deferred-spawn flow: execute original + advance state,
+        // but ALSO count towards match start (unlike late join)
+        if (gLateJoinManager && gLateJoinManager->IsInitialJoinPlayer(PBPlayerController)) {
+            ProcessEvent.call(Object, Function, Parms);
+            // Advance deferred-spawn state to RoleConfirmed
+            gLateJoinManager->OnRoleConfirmed(PBPlayerController);
 
-        if (!canStartMatch && NumPlayersSelectedRole >= NumExpectedPlayers) {
+            // Still count for match start
+            if (PBPlayerController) {
+                const auto [_, inserted] = PlayersConfirmedRole.insert(PBPlayerController);
+                if (inserted) {
+                    NumPlayersSelectedRole = static_cast<int>(PlayersConfirmedRole.size());
+                    std::cout << "[MATCH] Role confirmed by (initial-join) "
+                        << PBPlayerController->GetFullName()
+                        << " (" << NumPlayersSelectedRole << "/" << NumExpectedPlayers << ")" << std::endl;
+                }
+
+                if (!canStartMatch && NumExpectedPlayers > 0 && NumPlayersSelectedRole >= NumExpectedPlayers) {
+                    canStartMatch = true;
+                    StartMatchTimer = -1.0f;
+                }
+            }
+            return;
+        }
+
+        if (PBPlayerController) {
+            const auto [_, inserted] = PlayersConfirmedRole.insert(PBPlayerController);
+            if (inserted) {
+                NumPlayersSelectedRole = static_cast<int>(PlayersConfirmedRole.size());
+                std::cout << "[MATCH] Role confirmed by "
+                    << PBPlayerController->GetFullName()
+                    << " (" << NumPlayersSelectedRole << "/" << NumExpectedPlayers << ")" << std::endl;
+            }
+            else {
+                std::cout << "[MATCH] Ignoring duplicate role confirmation from "
+                    << PBPlayerController->GetFullName() << std::endl;
+            }
+
+        if (!canStartMatch && NumExpectedPlayers > 0 && NumPlayersSelectedRole >= NumExpectedPlayers) {
             canStartMatch = true;
+            StartMatchTimer = -1.0f;
         }
     }
 
     if (functionName.contains("ReadyToMatchIntro_WaitingToStart")) {
+        ApplyPendingPlayerNameUpdates("ReadyToMatchIntro_WaitingToStart");
         if (!canStartMatch) {
             return;
         }
@@ -749,7 +856,16 @@ void* PostLogin(AGameMode* GameMode, APBPlayerController* PC)
         return Ret;
     }
 
-    // Force first-life respawn fix
+    // Initial join: defer Pawn creation to LateJoinManager's delayed-spawn flow.
+    // This ensures weapons are created AFTER role confirmation (when pre-order
+    // inventory is already applied), fixing the loadout switching issue.
+    if (gLateJoinManager)
+    {
+        gLateJoinManager->QueueInitialJoinPlayer(GameMode, PC);
+        return Ret;
+    }
+
+    // Fallback: if LateJoinManager is not available, use the old immediate-respawn path
     if (PC && PC->Pawn)
     {
         PC->ServerSuicide(0);   // triggers respawn
