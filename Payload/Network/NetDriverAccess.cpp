@@ -1,10 +1,10 @@
-#include "framework.h"
+#include "../framework.h"
 
 #include <atomic>
 #include <cstring>
 
 #include "NetDriverAccess.h"
-#include "SDK.hpp"
+#include "../SDK.hpp"
 
 namespace {
 std::atomic<SDK::UNetDriver*> g_cachedNetDriver{ nullptr };

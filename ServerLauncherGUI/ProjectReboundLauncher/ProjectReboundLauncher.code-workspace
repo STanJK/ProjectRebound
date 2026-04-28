@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		}
+	],
+	"settings": {
+		"workbench.sideBar.location": "left",
+		"explorer.openEditors.visible": 1
+	}
+}

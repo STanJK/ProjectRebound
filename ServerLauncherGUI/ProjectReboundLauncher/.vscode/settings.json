@@ -1,0 +1,8 @@
+{
+  "C_Cpp.formatting": "clangFormat",
+  "C_Cpp.clang_format_style": "Microsoft",
+  "workbench.startupEditor": "none",
+  "workbench.sideBar.location": "left",
+  "files.autoSave": "off",
+  "explorer.openEditors.visible": 1,
+}

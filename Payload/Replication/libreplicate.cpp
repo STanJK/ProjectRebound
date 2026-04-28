@@ -1,11 +1,11 @@
 // libreplicate.cpp : Defines the functions for the static library.
 //
 
-#include "framework.h"
-#include "libreplicate.h"
+#include "../framework.h"
+#include "../Replication/libreplicate.h"
 #include <iostream>
 
-#include "SDK.hpp"
+#include "../SDK.hpp"
 
 LibReplicate::LibReplicate(EReplicationMode ReplicationMode, void* InitListenFuncPtr, void* CreateChannelFuncPtr, void* SetChannelActorFuncPtr, void* ReplicateActorFuncPtr, void* FMemoryMallocFuncPtr, void* FMemoryFreeFuncPtr, void* OrigNotifyControlMessageFuncPtr, void* CreateNamedNetDriverFuncPtr, void* ActorChannelCloseFuncPtr, void* SetWorldFuncPtr, void* CallPreReplicationFuncPtr, void* SendClientAdjustmentFuncPtr) {
 	this->JoinMode = EJoinMode::Closed;

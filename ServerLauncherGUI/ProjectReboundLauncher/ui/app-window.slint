@@ -1,0 +1,78 @@
+// ======================================================
+//  MAIN WINDOW – RESPONSIVE THREE‑COLUMN LAYOUT
+// ======================================================
+import { HorizontalBox, VerticalBox } from "std-widgets.slint";
+import { SideBar } from "sidebar.slint";
+import { AppState } from "app_state.slint";
+import { ServerConsolePage, ServerConfigPage, ServerStatusPage } from "pages.slint";
+
+export component AppWindow inherits Window {
+    preferred-width: 1440px;     // 默认宽度，用户可拖拽
+    min-width: 900px;            // 避免窗口过窄
+    height: 600px;
+    icon: @image-url("servericon.png");
+    title: "Project Boundary Server Launcher";
+
+    callback get-new-log() -> string;
+    callback get-log-length() -> int;
+    callback send_command(string);
+    callback start_server();
+
+    Timer {
+        interval: 200ms;
+        running: true;
+        triggered => {
+            AppState.console_text = root.get-new-log();
+            AppState.log-length = root.get-log-length();
+        }
+    }
+
+    HorizontalBox {
+        spacing: 4px;                     // 防止边框粘连
+
+        // ===== COLUMN 1: Fixed Sidebar =====
+        Rectangle {
+            width: 200px;
+            height: 100%;
+            border-width: 1px;
+            border-color: #87a4bed1;
+            border-radius: 4px;
+
+            VerticalBox {
+                side-bar := SideBar {
+                    model: ["Server Config", "Server Status"];
+                }
+            }
+        }
+
+        // ===== COLUMN 2: Flexible Page Area =====
+        Rectangle {
+            horizontal-stretch: 1;        // 自动缩放，与右侧平分剩余宽度
+            height: 100%;
+            border-width: 1px;
+            border-color: #87a4bed1;
+            border-radius: 4px;
+
+            VerticalBox {
+                if (side-bar.current-item == 0): ServerConfigPage { }
+                if (side-bar.current-item == 1): ServerStatusPage { }
+            }
+        }
+
+        // ===== COLUMN 3: Flexible Console =====
+        Rectangle {
+            horizontal-stretch: 1;        // 自动缩放，与中间平分剩余宽度
+            height: 100%;
+            border-width: 1px;
+            border-color: #87a4bed1;
+            border-radius: 4px;
+
+            VerticalBox {
+                ServerConsolePage {
+                    send_command(cmd) => { root.send_command(cmd); }
+                    start_server => { root.start_server(); }
+                }
+            }
+        }
+    }
+}

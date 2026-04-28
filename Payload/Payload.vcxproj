@@ -144,13 +144,17 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClInclude Include="NetDriverAccess.h" />
     <ClInclude Include="framework.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="ClientLogic\ClientLogic.cpp" />
+    <ClCompile Include="Config\Config.cpp" />
+    <ClCompile Include="Debug\Debug.cpp" />
     <ClCompile Include="dllmain.cpp" />
-    <ClCompile Include="NetDriverAccess.cpp" />
-    <ClCompile Include="libreplicate.cpp" />
+    <ClCompile Include="Hooks\Hooks.cpp" />
+    <ClCompile Include="Network\NetDriverAccess.cpp" />
+    <ClCompile Include="Network\Network.cpp" />
+    <ClCompile Include="Replication\libreplicate.cpp" />
     <ClCompile Include="safetyhook\safetyhook.cpp" />
     <ClCompile Include="safetyhook\Zydis.c" />
     <ClCompile Include="SDK\Basic.cpp" />
@@ -163,6 +167,9 @@
     <ClCompile Include="SDK\UMG_functions.cpp" />
     <ClCompile Include="SDK\UMG_LoginGate_functions.cpp" />
     <ClCompile Include="SDK\UMG_MainMenuLayout_functions.cpp" />
+    <ClCompile Include="ServerLogic\LateJoinManager.cpp" />
+    <ClCompile Include="ServerLogic\ServerLogic.cpp" />
+    <ClCompile Include="Utility\Utility.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

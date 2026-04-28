@@ -1,0 +1,47 @@
+import { TextEdit, LineEdit, Button, VerticalBox, HorizontalBox, CheckBox } from "std-widgets.slint";
+import { AppState } from "app_state.slint";
+
+export component ServerConsolePage {
+    // 页面需要的回调（由主窗口提供）
+    callback send_command(string);
+    callback start_server();
+
+    Timer {
+        interval: 200ms;
+        running: true;
+        triggered => {
+            if AppState.auto-scroll {
+                output.set-selection-offsets(AppState.log-length, AppState.log-length);
+            }
+        }
+    }
+
+    VerticalBox {
+        spacing: 8px;
+        output := TextEdit {
+            text: AppState.console_text;
+            read-only: true;
+            wrap: word-wrap;
+        }
+        HorizontalBox {
+            spacing: 8px; height: 40px;
+            input := LineEdit {
+                placeholder-text: "Enter command...";
+                accepted => { root.send_command(input.text); input.text = ""; }
+            }
+            Button {
+                text: "Send";
+                clicked => { root.send_command(input.text); input.text = ""; }
+            }
+            Button {
+                text: "Start Server";
+                clicked => { root.start_server(); }
+            }
+            auto-scroll-check := CheckBox {
+                text: "Auto-scroll";
+                checked: AppState.auto-scroll;
+                toggled => { AppState.auto-scroll = !AppState.auto-scroll; }
+            }
+        }
+    }
+}
