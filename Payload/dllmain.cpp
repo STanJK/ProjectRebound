@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <random>
+#include <unordered_map>
 #include <winhttp.h>
 #pragma comment(lib, "winhttp.lib")
 
@@ -347,188 +348,252 @@ std::unordered_map<APBPlayerController*, bool> PlayerRespawnAllowedMap{};
 
 SafetyHookInline TickFlush = {};
 
-void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
-    if (listening && NetDriver && UWorld::GetWorld()) {
-        NetDriverAccess::Observe(NetDriver, UWorld::GetWorld(), NetDriverAccess::Source::HookArgument);
+struct TickFlushReplicationInputs {
+    std::vector<LibReplicate::FActorInfo> ActorInfos;
+    std::vector<LibReplicate::FPlayerControllerInfo> PlayerControllerInfos;
+    std::vector<void*> CastConnections;
+};
 
-        if (PlayerJoinTimerSelectFuck > 0.0f) {
-            PlayerJoinTimerSelectFuck -= DeltaTime;
+FName* GetActorChannelName()
+{
+    static FName* ActorName = nullptr;
 
-            if (PlayerJoinTimerSelectFuck <= 0.0f) {
+    if (!ActorName) {
+        ActorName = new FName();
+        FName ConvertedName = UKismetStringLibrary::Conv_StringToName(L"Actor");
+        ActorName->ComparisonIndex = ConvertedName.ComparisonIndex;
+        ActorName->Number = ConvertedName.Number;
+    }
 
-                for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
-                {
-                    SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+    return ActorName;
+}
 
-                    if (!Obj)
-                        continue;
+void ProcessPendingRoleSelection(float DeltaTime)
+{
+    if (PlayerJoinTimerSelectFuck <= 0.0f)
+        return;
 
-                    if (Obj->IsDefaultObject())
-                        continue;
+    PlayerJoinTimerSelectFuck -= DeltaTime;
 
-                    if (Obj->IsA(APBPlayerController::StaticClass()))
-                    {
-                        if (((APBPlayerController*)Obj)->CanSelectRole()) {
-                            std::cout << "Selecting role..." << std::endl;
-                            ((APBPlayerController*)Obj)->ClientSelectRole();
-                        }
-                        else {
-                            std::cout << "CANT SELECT ROLE WEE WOO WEE WOO" << std::endl;
-                        }
-                    }
-                }
+    if (PlayerJoinTimerSelectFuck > 0.0f)
+        return;
 
+    for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
+    {
+        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+
+        if (!Obj)
+            continue;
+
+        if (Obj->IsDefaultObject())
+            continue;
+
+        if (Obj->IsA(APBPlayerController::StaticClass()))
+        {
+            if (((APBPlayerController*)Obj)->CanSelectRole()) {
+                std::cout << "Selecting role..." << std::endl;
+                ((APBPlayerController*)Obj)->ClientSelectRole();
+            }
+            else {
+                std::cout << "CANT SELECT ROLE WEE WOO WEE WOO" << std::endl;
             }
         }
+    }
+}
 
-        std::vector<LibReplicate::FActorInfo> ActorInfos = std::vector<LibReplicate::FActorInfo>();
-        std::vector<UNetConnection*> Connections = std::vector<UNetConnection*>();
-        std::vector<void*> PlayerControllers = std::vector<void*>();
+void ApplyPlayerControllerMovementFix(APlayerController* PlayerController)
+{
+    if (!PlayerController || !PlayerController->Character)
+        return;
 
-        for (UNetConnection* Connection : NetDriver->ClientConnections) {
-            if (Connection->OwningActor) {
-                Connection->ViewTarget = Connection->PlayerController ? Connection->PlayerController->GetViewTarget() : Connection->OwningActor;
-                Connections.push_back(Connection);
-            }
-        }
+    auto* MovementComponent = PlayerController->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass());
+    if (!MovementComponent)
+        return;
 
-        for (int i = 0; i < UWorld::GetWorld()->Levels.Num(); i++) {
-            ULevel* Level = UWorld::GetWorld()->Levels[i];
+    UCharacterMovementComponent* CharacterMovement = (UCharacterMovementComponent*)MovementComponent;
+    CharacterMovement->bIgnoreClientMovementErrorChecksAndCorrection = true;
+    CharacterMovement->bServerAcceptClientAuthoritativePosition = true;
+}
 
-            if (Level) {
-                for (int j = 0; j < Level->Actors.Num(); j++) {
-                    AActor* actor = Level->Actors[j];
+TickFlushReplicationInputs BuildReplicationInputs(UWorld* World, UNetDriver* NetDriver)
+{
+    TickFlushReplicationInputs Inputs{};
+    const int ConnectionCount = NetDriver->ClientConnections.Num();
 
-                    if (!actor)
-                        continue;
+    Inputs.CastConnections.reserve(ConnectionCount);
+    Inputs.PlayerControllerInfos.reserve(ConnectionCount);
 
-                    if (actor->RemoteRole == ENetRole::ROLE_None)
-                        continue;
+    // Preserve the original first-match behavior without the later PlayerController x Connection scan.
+    std::unordered_map<void*, UNetConnection*> ConnectionByPlayerController{};
+    ConnectionByPlayerController.reserve(ConnectionCount);
 
-                    if (!actor->bReplicates)
-                        continue;
+    for (UNetConnection* Connection : NetDriver->ClientConnections) {
+        if (Connection->OwningActor) {
+            Connection->ViewTarget = Connection->PlayerController ? Connection->PlayerController->GetViewTarget() : Connection->OwningActor;
+            Inputs.CastConnections.push_back((void*)Connection);
 
-                    if (actor->bActorIsBeingDestroyed)
-                        continue;
-
-                    if (actor->Class == APlayerController_BP_C::StaticClass()) {
-                        PlayerControllers.push_back((void*)actor);
-                        if (((APlayerController*)actor)->Character && ((APlayerController*)actor)->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass())) {
-                            ((UCharacterMovementComponent*)(((APlayerController*)actor)->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass())))->bIgnoreClientMovementErrorChecksAndCorrection = true;
-                            ((UCharacterMovementComponent*)(((APlayerController*)actor)->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass())))->bServerAcceptClientAuthoritativePosition = true;
-                        }
-                        continue;
-                    }
-
-                    ActorInfos.push_back(LibReplicate::FActorInfo(actor, actor->bNetTemporary));
-                }
-            }
-        }
-
-        std::vector<LibReplicate::FPlayerControllerInfo> PlayerControllerInfos = std::vector<LibReplicate::FPlayerControllerInfo>();
-
-        for (void* PlayerController : PlayerControllers) {
-            for (UNetConnection* Connection : Connections) {
-                if (Connection->PlayerController == PlayerController) {
-                    PlayerControllerInfos.push_back(LibReplicate::FPlayerControllerInfo(Connection, PlayerController));
-                    break;
-                }
-            }
-        }
-
-        std::vector<void*> CastConnections = std::vector<void*>();
-
-        for (UNetConnection* Connection : Connections) {
-            CastConnections.push_back((void*)Connection);
-        }
-
-        static FName* ActorName = nullptr;
-
-        if (!ActorName) {
-            ActorName = new FName();
-            ActorName->ComparisonIndex = UKismetStringLibrary::Conv_StringToName(L"Actor").ComparisonIndex;
-            ActorName->Number = UKismetStringLibrary::Conv_StringToName(L"Actor").Number;
-        }
-
-        if (ActorInfos.size() > 0 && CastConnections.size() > 0) {
-            if (NetDriver) {
-                libReplicate->CallFromTickFlushHook(ActorInfos, PlayerControllerInfos, CastConnections, ActorName, NetDriver);
-
-                int* counter = reinterpret_cast<int*>(reinterpret_cast<char*>(NetDriver) + 0x420);
-                *counter = *counter + 1;
+            if (Connection->PlayerController) {
+                ConnectionByPlayerController.emplace((void*)Connection->PlayerController, Connection);
             }
         }
     }
 
-    if (!((APBGameState*)(UWorld::GetWorld()->AuthorityGameMode->GameState))->IsRoundInProgress()) {
-        if (((APBGameState*)(UWorld::GetWorld()->AuthorityGameMode->GameState))->RoundState.ToString().contains("InvalidState")) {
+    int ActorCapacity = 0;
+    for (int i = 0; i < World->Levels.Num(); i++) {
+        ULevel* Level = World->Levels[i];
+        if (Level) {
+            ActorCapacity += Level->Actors.Num();
+        }
+    }
+    Inputs.ActorInfos.reserve(ActorCapacity);
 
-            if (NumPlayersJoined >= Config.MinPlayersToStart) {
-                if (!DidProcFlow) {
-                    if (MatchStartCountdown == -1.0f) {
-                        MatchStartCountdown = 30.0f;
+    for (int i = 0; i < World->Levels.Num(); i++) {
+        ULevel* Level = World->Levels[i];
+
+        if (Level) {
+            for (int j = 0; j < Level->Actors.Num(); j++) {
+                AActor* actor = Level->Actors[j];
+
+                if (!actor)
+                    continue;
+
+                if (actor->RemoteRole == ENetRole::ROLE_None)
+                    continue;
+
+                if (!actor->bReplicates)
+                    continue;
+
+                if (actor->bActorIsBeingDestroyed)
+                    continue;
+
+                if (actor->Class == APlayerController_BP_C::StaticClass()) {
+                    auto Connection = ConnectionByPlayerController.find((void*)actor);
+                    if (Connection != ConnectionByPlayerController.end()) {
+                        Inputs.PlayerControllerInfos.push_back(LibReplicate::FPlayerControllerInfo(Connection->second, actor));
+                    }
+
+                    ApplyPlayerControllerMovementFix((APlayerController*)actor);
+                    continue;
+                }
+
+                Inputs.ActorInfos.push_back(LibReplicate::FActorInfo(actor, actor->bNetTemporary));
+            }
+        }
+    }
+
+    return Inputs;
+}
+
+void ReplicateActorsForTick(UWorld* World, UNetDriver* NetDriver)
+{
+    TickFlushReplicationInputs Inputs = BuildReplicationInputs(World, NetDriver);
+
+    if (!Inputs.ActorInfos.empty() && !Inputs.CastConnections.empty()) {
+        libReplicate->CallFromTickFlushHook(Inputs.ActorInfos, Inputs.PlayerControllerInfos, Inputs.CastConnections, GetActorChannelName(), NetDriver);
+
+        int* counter = reinterpret_cast<int*>(reinterpret_cast<char*>(NetDriver) + 0x420);
+        *counter = *counter + 1;
+    }
+}
+
+void UpdateMatchStartFlow(UWorld* World, UNetDriver* NetDriver, float DeltaTime)
+{
+    if (!World || !World->AuthorityGameMode || !World->AuthorityGameMode->GameState)
+        return;
+
+    APBGameState* GameState = (APBGameState*)World->AuthorityGameMode->GameState;
+    if (GameState->IsRoundInProgress())
+        return;
+
+    const std::string RoundState = GameState->RoundState.ToString();
+
+    if (RoundState.contains("InvalidState")) {
+        if (NumPlayersJoined >= Config.MinPlayersToStart) {
+            if (!DidProcFlow) {
+                if (MatchStartCountdown == -1.0f) {
+                    MatchStartCountdown = 30.0f;
+
+                    NumExpectedPlayers = NumPlayersJoined;
+                }
+                else {
+                    MatchStartCountdown -= DeltaTime;
+
+                    if (NumExpectedPlayers > NumPlayersJoined) {
+                        NumExpectedPlayers = NumPlayersJoined;
+
+                        MatchStartCountdown += 15.0f;
+                    }
+
+                    if (MatchStartCountdown <= 0.0f) {
+                        DidProcFlow = true;
+
+                        std::cout << "All players connected, beginning role selection flow!" << std::endl;
+
+                        PlayerJoinTimerSelectFuck = 5.0f;
 
                         NumExpectedPlayers = NumPlayersJoined;
                     }
-                    else {
-                        MatchStartCountdown -= DeltaTime;
-
-                        if (NumExpectedPlayers > NumPlayersJoined) {
-                            NumExpectedPlayers = NumPlayersJoined;
-
-                            MatchStartCountdown += 15.0f;
-                        }
-
-                        if (MatchStartCountdown <= 0.0f) {
-                            DidProcFlow = true;
-
-                            std::cout << "All players connected, beginning role selection flow!" << std::endl;
-
-                            PlayerJoinTimerSelectFuck = 5.0f;
-
-                            NumExpectedPlayers = NumPlayersJoined;
-                        }
-                    }
                 }
             }
         }
-
-        if (((APBGameState*)(UWorld::GetWorld()->AuthorityGameMode->GameState))->RoundState.ToString().contains("CountdownToStart")) {
-
-            for (UNetConnection* pc : NetDriver->ClientConnections) {
-                if (pc->PlayerController && pc->PlayerController->Pawn)
-                    pc->PlayerController->Possess(pc->PlayerController->Pawn);
-            }
-        }
     }
 
-    if (canStartMatch && !DidProcStartMatch) {
+    if (NetDriver && RoundState.contains("CountdownToStart")) {
+
+        for (UNetConnection* pc : NetDriver->ClientConnections) {
+            if (pc->PlayerController && pc->PlayerController->Pawn)
+                pc->PlayerController->Possess(pc->PlayerController->Pawn);
+        }
+    }
+}
+
+void TryStartMatch(UWorld* World)
+{
+    if (canStartMatch && !DidProcStartMatch && World && World->AuthorityGameMode) {
         DidProcStartMatch = true;
 
-        ((APBGameMode*)UWorld::GetWorld()->AuthorityGameMode)->StartMatch();
+        ((APBGameMode*)World->AuthorityGameMode)->StartMatch();
     }
+}
 
-    if (GetAsyncKeyState(VK_F8) && amServer) {
-        for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
+void HandleServerSuicideHotkey()
+{
+    if (!(GetAsyncKeyState(VK_F8) && amServer))
+        return;
+
+    for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
+    {
+        SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+
+        if (!Obj)
+            continue;
+
+        if (Obj->IsDefaultObject())
+            continue;
+
+        if (Obj->IsA(APBPlayerController::StaticClass()))
         {
-            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
-
-            if (!Obj)
-                continue;
-
-            if (Obj->IsDefaultObject())
-                continue;
-
-            if (Obj->IsA(APBPlayerController::StaticClass()))
-            {
-                ((APBPlayerController*)Obj)->ServerSuicide(0);
-            }
-        }
-
-        while (GetAsyncKeyState(VK_F8)) {
-
+            ((APBPlayerController*)Obj)->ServerSuicide(0);
         }
     }
+
+    while (GetAsyncKeyState(VK_F8)) {
+
+    }
+}
+
+void TickFlushHook(UNetDriver* NetDriver, float DeltaTime) {
+    UWorld* World = UWorld::GetWorld();
+
+    if (listening && NetDriver && World) {
+        NetDriverAccess::Observe(NetDriver, World, NetDriverAccess::Source::HookArgument);
+        ProcessPendingRoleSelection(DeltaTime);
+        ReplicateActorsForTick(World, NetDriver);
+    }
+
+    UpdateMatchStartFlow(World, NetDriver, DeltaTime);
+    TryStartMatch(World);
+    HandleServerSuicideHotkey();
 
     return TickFlush.call(NetDriver, DeltaTime);
 }
