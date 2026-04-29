@@ -1,9 +1,16 @@
 // Hooks.cpp
 #include "Hooks.h"
 #include <Windows.h>
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <iostream>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <utility>
 #include "../SDK.hpp"
+#include "../GameOffsets.h"
 #include "../Network/NetDriverAccess.h"
 #include "../SDK/Engine_parameters.hpp"
 #include "../SDK/ProjectBoundary_parameters.hpp"
@@ -22,6 +29,275 @@ extern LibReplicate* libReplicate;
 
 using namespace SDK;
 
+namespace
+{
+    enum class EServerProcessEventKind
+    {
+        None,
+        QuickRespawn,
+        ServerRestartPlayer,
+        CanPlayerSelectRole,
+        CanSelectRole,
+        ServerConfirmRoleSelection,
+        ReadyToMatchIntroWaitingToStart,
+        ClientBeKilled,
+        PlayerCanRestart
+    };
+
+    enum class EClientProcessEventKind
+    {
+        None,
+        EnterGameConstruct,
+        EnterGameActivated,
+        MainMenuConstruct,
+        ConnectMatchServerTimeout
+    };
+
+    struct FCachedProcessEventInfo
+    {
+        std::string FullName;
+        EServerProcessEventKind ServerKind = EServerProcessEventKind::None;
+        EClientProcessEventKind ClientKind = EClientProcessEventKind::None;
+    };
+
+    struct FTickReplicationBatch
+    {
+        std::vector<LibReplicate::FActorInfo> ActorInfos;
+        std::vector<LibReplicate::FPlayerControllerInfo> PlayerControllerInfos;
+        std::vector<void*> Connections;
+        std::unordered_map<void*, void*> ConnectionByPlayerController;
+
+        void Reset(int connectionCount)
+        {
+            ActorInfos.clear();
+            PlayerControllerInfos.clear();
+            Connections.clear();
+            ConnectionByPlayerController.clear();
+
+            const size_t connectionCapacity = connectionCount > 0 ? static_cast<size_t>(connectionCount) : 0;
+            Connections.reserve(connectionCapacity);
+            PlayerControllerInfos.reserve(connectionCapacity);
+            ConnectionByPlayerController.reserve(connectionCapacity);
+        }
+    };
+
+    struct FInlineHookSpec
+    {
+        const char* Name;
+        SafetyHookInline* Storage;
+        uintptr_t Offset;
+        void* Detour;
+    };
+
+    EServerProcessEventKind ClassifyServerProcessEvent(const std::string& functionName)
+    {
+        if (functionName.contains("QuickRespawn"))
+            return EServerProcessEventKind::QuickRespawn;
+        if (functionName.contains("ServerRestartPlayer"))
+            return EServerProcessEventKind::ServerRestartPlayer;
+        if (functionName.contains("CanPlayerSelectRole"))
+            return EServerProcessEventKind::CanPlayerSelectRole;
+        if (functionName.contains("CanSelectRole"))
+            return EServerProcessEventKind::CanSelectRole;
+        if (functionName.contains("ServerConfirmRoleSelection"))
+            return EServerProcessEventKind::ServerConfirmRoleSelection;
+        if (functionName.contains("ReadyToMatchIntro_WaitingToStart"))
+            return EServerProcessEventKind::ReadyToMatchIntroWaitingToStart;
+        if (functionName.contains("ClientBeKilled"))
+            return EServerProcessEventKind::ClientBeKilled;
+        if (functionName.contains("PlayerCanRestart"))
+            return EServerProcessEventKind::PlayerCanRestart;
+
+        return EServerProcessEventKind::None;
+    }
+
+    EClientProcessEventKind ClassifyClientProcessEvent(const std::string& functionName)
+    {
+        if (functionName.contains("UMG_EnterGame_C.Construct"))
+            return EClientProcessEventKind::EnterGameConstruct;
+        if (functionName.contains("UMG_EnterGame_C.BP_OnActivated"))
+            return EClientProcessEventKind::EnterGameActivated;
+        if (functionName.contains("UMG_MainMenuBase_C.Construct"))
+            return EClientProcessEventKind::MainMenuConstruct;
+        if (functionName.contains("OnConnectMatchServerTimeOut"))
+            return EClientProcessEventKind::ConnectMatchServerTimeout;
+
+        return EClientProcessEventKind::None;
+    }
+
+    const FCachedProcessEventInfo& GetProcessEventInfo(UFunction* Function)
+    {
+        // ProcessEvent is broad and hot; cache classification per game thread by UFunction pointer.
+        thread_local std::unordered_map<UFunction*, FCachedProcessEventInfo> Cache;
+
+        auto existing = Cache.find(Function);
+        if (existing != Cache.end())
+        {
+            return existing->second;
+        }
+
+        FCachedProcessEventInfo info{};
+        if (Function)
+        {
+            info.FullName = Function->GetFullName();
+            info.ServerKind = ClassifyServerProcessEvent(info.FullName);
+            info.ClientKind = ClassifyClientProcessEvent(info.FullName);
+        }
+
+        auto insertResult = Cache.emplace(Function, std::move(info));
+        return insertResult.first->second;
+    }
+
+    bool IsLateJoinRoleQuery(EServerProcessEventKind kind)
+    {
+        return kind == EServerProcessEventKind::CanPlayerSelectRole ||
+               kind == EServerProcessEventKind::CanSelectRole;
+    }
+
+    FName* GetActorChannelName()
+    {
+        static FName ActorName = UKismetStringLibrary::Conv_StringToName(L"Actor");
+        return &ActorName;
+    }
+
+    void SelectRoleForQueuedPlayers()
+    {
+        if (!SDK::UObject::GObjects)
+            return;
+
+        for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; --i)
+        {
+            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+
+            if (!Obj || Obj->IsDefaultObject())
+                continue;
+
+            if (Obj->IsA(APBPlayerController::StaticClass()))
+            {
+                auto* PlayerController = static_cast<APBPlayerController*>(Obj);
+                if (PlayerController->CanSelectRole())
+                {
+                    std::cout << "Selecting role..." << std::endl;
+                    PlayerController->ClientSelectRole();
+                }
+                else
+                {
+                    std::cout << "CANT SELECT ROLE WEE WOO WEE WOO" << std::endl;
+                }
+            }
+        }
+    }
+
+    void CollectTickReplicationBatch(UNetDriver* NetDriver, UWorld* World, FTickReplicationBatch& Batch)
+    {
+        const int connectionCount = NetDriver ? NetDriver->ClientConnections.Num() : 0;
+        Batch.Reset(connectionCount);
+
+        if (!NetDriver || !World)
+            return;
+
+        for (UNetConnection* Connection : NetDriver->ClientConnections)
+        {
+            if (!Connection || !Connection->OwningActor)
+                continue;
+
+            Connection->ViewTarget = Connection->PlayerController
+                ? Connection->PlayerController->GetViewTarget()
+                : Connection->OwningActor;
+
+            Batch.Connections.push_back(Connection);
+
+            if (Connection->PlayerController)
+            {
+                // Preserve the original first-connection match while avoiding a nested scan later.
+                Batch.ConnectionByPlayerController.emplace(Connection->PlayerController, Connection);
+            }
+        }
+
+        for (int i = 0; i < World->Levels.Num(); ++i)
+        {
+            ULevel* Level = World->Levels[i];
+            if (!Level)
+                continue;
+
+            for (int j = 0; j < Level->Actors.Num(); ++j)
+            {
+                AActor* actor = Level->Actors[j];
+                if (!actor)
+                    continue;
+                if (actor->RemoteRole == ENetRole::ROLE_None)
+                    continue;
+                if (!actor->bReplicates)
+                    continue;
+                if (actor->bActorIsBeingDestroyed)
+                    continue;
+
+                if (actor->Class == APlayerController_BP_C::StaticClass())
+                {
+                    auto* PlayerController = static_cast<APlayerController*>(actor);
+                    auto connectionIt = Batch.ConnectionByPlayerController.find(PlayerController);
+                    if (connectionIt != Batch.ConnectionByPlayerController.end())
+                    {
+                        Batch.PlayerControllerInfos.emplace_back(connectionIt->second, PlayerController);
+                    }
+
+                    if (PlayerController->Character)
+                    {
+                        auto* Movement = static_cast<UCharacterMovementComponent*>(
+                            PlayerController->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass()));
+                        if (Movement)
+                        {
+                            Movement->bIgnoreClientMovementErrorChecksAndCorrection = true;
+                            Movement->bServerAcceptClientAuthoritativePosition = true;
+                        }
+                    }
+
+                    continue;
+                }
+
+                Batch.ActorInfos.emplace_back(actor, actor->bNetTemporary);
+            }
+        }
+    }
+
+    void ForceServerSuicideForAllPlayers()
+    {
+        if (!SDK::UObject::GObjects)
+            return;
+
+        for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; --i)
+        {
+            SDK::UObject* Obj = SDK::UObject::GObjects->GetByIndex(i);
+
+            if (!Obj || Obj->IsDefaultObject())
+                continue;
+
+            if (Obj->IsA(APBPlayerController::StaticClass()))
+            {
+                static_cast<APBPlayerController*>(Obj)->ServerSuicide(0);
+            }
+        }
+    }
+
+    void InstallInlineHook(const FInlineHookSpec& spec)
+    {
+        *spec.Storage = safetyhook::create_inline(GameOffsets::Resolve(BaseAddress, spec.Offset), spec.Detour);
+        if (!static_cast<bool>(*spec.Storage))
+        {
+            Log("[HOOK] Failed to install " + std::string(spec.Name));
+        }
+    }
+
+    template <size_t Count>
+    void InstallInlineHooks(const FInlineHookSpec (&specs)[Count])
+    {
+        for (const FInlineHookSpec& spec : specs)
+        {
+            InstallInlineHook(spec);
+        }
+    }
+}
+
 // ======================================================
 //  SECTION 7 — HOOK DETOURS (ENGINE HOOKS)
 // ======================================================
@@ -30,9 +306,11 @@ static SafetyHookInline TickFlush = {};
 
 void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
 {
-    if (listening && NetDriver && UWorld::GetWorld())
+    UWorld* World = UWorld::GetWorld();
+
+    if (listening && NetDriver && World)
     {
-        NetDriverAccess::Observe(NetDriver, UWorld::GetWorld(), NetDriverAccess::Source::HookArgument);
+        NetDriverAccess::Observe(NetDriver, World, NetDriverAccess::Source::HookArgument);
 
         if (PlayerJoinTimerSelectFuck > 0.0f)
         {
@@ -40,123 +318,24 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
 
             if (PlayerJoinTimerSelectFuck <= 0.0f)
             {
-
-                for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
-                {
-                    SDK::UObject *Obj = SDK::UObject::GObjects->GetByIndex(i);
-
-                    if (!Obj)
-                        continue;
-
-                    if (Obj->IsDefaultObject())
-                        continue;
-
-                    if (Obj->IsA(APBPlayerController::StaticClass()))
-                    {
-                        if (((APBPlayerController *)Obj)->CanSelectRole())
-                        {
-                            std::cout << "Selecting role..." << std::endl;
-                            ((APBPlayerController *)Obj)->ClientSelectRole();
-                        }
-                        else
-                        {
-                            std::cout << "CANT SELECT ROLE WEE WOO WEE WOO" << std::endl;
-                        }
-                    }
-                }
+                SelectRoleForQueuedPlayers();
             }
         }
 
-        std::vector<LibReplicate::FActorInfo> ActorInfos = std::vector<LibReplicate::FActorInfo>();
-        std::vector<UNetConnection *> Connections = std::vector<UNetConnection *>();
-        std::vector<void *> PlayerControllers = std::vector<void *>();
+        thread_local FTickReplicationBatch ReplicationBatch;
+        CollectTickReplicationBatch(NetDriver, World, ReplicationBatch);
 
-        for (UNetConnection *Connection : NetDriver->ClientConnections)
+        if (!ReplicationBatch.ActorInfos.empty() && !ReplicationBatch.Connections.empty() && libReplicate)
         {
-            if (Connection->OwningActor)
-            {
-                Connection->ViewTarget = Connection->PlayerController ? Connection->PlayerController->GetViewTarget() : Connection->OwningActor;
-                Connections.push_back(Connection);
-            }
-        }
+            libReplicate->CallFromTickFlushHook(
+                ReplicationBatch.ActorInfos,
+                ReplicationBatch.PlayerControllerInfos,
+                ReplicationBatch.Connections,
+                GetActorChannelName(),
+                NetDriver);
 
-        for (int i = 0; i < UWorld::GetWorld()->Levels.Num(); i++)
-        {
-            ULevel *Level = UWorld::GetWorld()->Levels[i];
-
-            if (Level)
-            {
-                for (int j = 0; j < Level->Actors.Num(); j++)
-                {
-                    AActor *actor = Level->Actors[j];
-
-                    if (!actor)
-                        continue;
-
-                    if (actor->RemoteRole == ENetRole::ROLE_None)
-                        continue;
-
-                    if (!actor->bReplicates)
-                        continue;
-
-                    if (actor->bActorIsBeingDestroyed)
-                        continue;
-
-                    if (actor->Class == APlayerController_BP_C::StaticClass())
-                    {
-                        PlayerControllers.push_back((void *)actor);
-                        if (((APlayerController *)actor)->Character && ((APlayerController *)actor)->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass()))
-                        {
-                            ((UCharacterMovementComponent *)(((APlayerController *)actor)->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass())))->bIgnoreClientMovementErrorChecksAndCorrection = true;
-                            ((UCharacterMovementComponent *)(((APlayerController *)actor)->Character->GetComponentByClass(UCharacterMovementComponent::StaticClass())))->bServerAcceptClientAuthoritativePosition = true;
-                        }
-                        continue;
-                    }
-
-                    ActorInfos.push_back(LibReplicate::FActorInfo(actor, actor->bNetTemporary));
-                }
-            }
-        }
-
-        std::vector<LibReplicate::FPlayerControllerInfo> PlayerControllerInfos = std::vector<LibReplicate::FPlayerControllerInfo>();
-
-        for (void *PlayerController : PlayerControllers)
-        {
-            for (UNetConnection *Connection : Connections)
-            {
-                if (Connection->PlayerController == PlayerController)
-                {
-                    PlayerControllerInfos.push_back(LibReplicate::FPlayerControllerInfo(Connection, PlayerController));
-                    break;
-                }
-            }
-        }
-
-        std::vector<void *> CastConnections = std::vector<void *>();
-
-        for (UNetConnection *Connection : Connections)
-        {
-            CastConnections.push_back((void *)Connection);
-        }
-
-        static FName *ActorName = nullptr;
-
-        if (!ActorName)
-        {
-            ActorName = new FName();
-            ActorName->ComparisonIndex = UKismetStringLibrary::Conv_StringToName(L"Actor").ComparisonIndex;
-            ActorName->Number = UKismetStringLibrary::Conv_StringToName(L"Actor").Number;
-        }
-
-        if (ActorInfos.size() > 0 && CastConnections.size() > 0)
-        {
-            if (NetDriver)
-            {
-                libReplicate->CallFromTickFlushHook(ActorInfos, PlayerControllerInfos, CastConnections, ActorName, NetDriver);
-
-                int *counter = reinterpret_cast<int *>(reinterpret_cast<char *>(NetDriver) + 0x420);
-                *counter = *counter + 1;
-            }
+            int *counter = reinterpret_cast<int *>(reinterpret_cast<char *>(NetDriver) + 0x420);
+            *counter = *counter + 1;
         }
 
         // Drive LateJoin state machine
@@ -167,7 +346,9 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
     APBGameState *CurrentGameState = GetPBGameState();
     if (CurrentGameState && !CurrentGameState->IsRoundInProgress())
     {
-        if (CurrentGameState->RoundState.ToString().contains("InvalidState"))
+        const std::string RoundState = CurrentGameState->RoundState.ToString();
+
+        if (RoundState.contains("InvalidState"))
         {
 
             if (NumPlayersJoined >= Config.MinPlayersToStart)
@@ -206,7 +387,7 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
             }
         }
 
-        if (CurrentGameState->RoundState.ToString().contains("CountdownToStart"))
+        if (RoundState.contains("CountdownToStart") && NetDriver)
         {
 
             for (UNetConnection *pc : NetDriver->ClientConnections)
@@ -221,29 +402,22 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
     {
         DidProcStartMatch = true;
 
-        ((APBGameMode *)UWorld::GetWorld()->AuthorityGameMode)->StartMatch();
-    }
-
-    if (GetAsyncKeyState(VK_F8) && amServer)
-    {
-        for (int i = SDK::UObject::GObjects->Num() - 1; i >= 0; i--)
+        if (UWorld* CurrentWorld = UWorld::GetWorld())
         {
-            SDK::UObject *Obj = SDK::UObject::GObjects->GetByIndex(i);
-
-            if (!Obj)
-                continue;
-
-            if (Obj->IsDefaultObject())
-                continue;
-
-            if (Obj->IsA(APBPlayerController::StaticClass()))
+            if (CurrentWorld->AuthorityGameMode)
             {
-                ((APBPlayerController *)Obj)->ServerSuicide(0);
+                ((APBGameMode *)CurrentWorld->AuthorityGameMode)->StartMatch();
             }
         }
+    }
 
-        while (GetAsyncKeyState(VK_F8))
+    if ((GetAsyncKeyState(VK_F8) & 0x8000) && amServer)
+    {
+        ForceServerSuicideForAllPlayers();
+
+        while (GetAsyncKeyState(VK_F8) & 0x8000)
         {
+            Sleep(10);
         }
     }
 
@@ -296,20 +470,21 @@ static SafetyHookInline ProcessEvent;
 
 void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
 {
-    const std::string functionName = Function ? std::string(Function->GetFullName()) : "";
+    const FCachedProcessEventInfo& EventInfo = GetProcessEventInfo(Function);
 
-    if (functionName.contains("QuickRespawn"))
+    if (EventInfo.ServerKind == EServerProcessEventKind::QuickRespawn)
     {
         APBPlayerController *PBPlayerController = (APBPlayerController *)Object;
 
         PlayerRespawnAllowedMap[PBPlayerController] = true;
     }
 
-    if (functionName.contains("ServerRestartPlayer"))
+    if (EventInfo.ServerKind == EServerProcessEventKind::ServerRestartPlayer)
     {
         APBPlayerController *PBPlayerController = (APBPlayerController *)Object;
+        auto respawnAllowed = PlayerRespawnAllowedMap.find(PBPlayerController);
 
-        if (PlayerRespawnAllowedMap.contains(PBPlayerController) && PlayerRespawnAllowedMap[PBPlayerController] == false)
+        if (respawnAllowed != PlayerRespawnAllowedMap.end() && !respawnAllowed->second)
         {
             std::cout << "Denied restart!" << std::endl;
             return;
@@ -317,7 +492,8 @@ void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
     }
 
     // LateJoin: role-selection interception (CanPlayerSelectRole / CanSelectRole)
-    if (gLateJoinManager && gLateJoinManager->OnProcessEvent(Object, functionName, Parms))
+    if (gLateJoinManager && IsLateJoinRoleQuery(EventInfo.ServerKind) &&
+        gLateJoinManager->OnProcessEvent(Object, EventInfo.FullName, Parms))
     {
         // Already handled by LateJoinManager
         return;
@@ -325,7 +501,7 @@ void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
 
     // LateJoin: ServerConfirmRoleSelection
     // Must call original ProcessEvent first, then advance LateJoin state
-    if (functionName.contains("ServerConfirmRoleSelection"))
+    if (EventInfo.ServerKind == EServerProcessEventKind::ServerConfirmRoleSelection)
     {
         APBPlayerController *PBPlayerController = Object && Object->IsA(APBPlayerController::StaticClass())
                                                       ? (APBPlayerController *)Object
@@ -348,7 +524,7 @@ void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
         }
     }
 
-    if (functionName.contains("ReadyToMatchIntro_WaitingToStart"))
+    if (EventInfo.ServerKind == EServerProcessEventKind::ReadyToMatchIntroWaitingToStart)
     {
         if (!canStartMatch)
         {
@@ -356,7 +532,7 @@ void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
         }
     }
 
-    if (functionName.contains("ClientBeKilled"))
+    if (EventInfo.ServerKind == EServerProcessEventKind::ClientBeKilled)
     {
         std::cout << "Intercepted Player Kill!" << std::endl;
 
@@ -365,7 +541,7 @@ void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
         PlayerRespawnAllowedMap[PBPlayerController] = false;
     }
 
-    if (functionName.contains("PlayerCanRestart"))
+    if (EventInfo.ServerKind == EServerProcessEventKind::PlayerCanRestart)
     {
         ((Params::GameModeBase_PlayerCanRestart *)Parms)->ReturnValue =
             ((AGameModeBase *)Object)->HasMatchStarted();
@@ -405,7 +581,7 @@ static SafetyHookInline OnFireWeaponHook;
 
 void *OnFireWeapon(APBWeapon *Weapon)
 {
-    if ((uintptr_t)_ReturnAddress() - BaseAddress != 0x1608B31)
+    if ((uintptr_t)_ReturnAddress() - BaseAddress != GameOffsets::ReturnAddress::OnFireWeaponAllowedCaller)
     {
         return nullptr;
     }
@@ -429,8 +605,10 @@ void ProcessEventHookClient(UObject *Object, UFunction *Function, void *Parms)
     //    std::string fn = Function->GetFullName();
     //        std::cout << "[LOGIN-DUMP] GI :: " << fn << std::endl;
     //}
+    const FCachedProcessEventInfo& EventInfo = GetProcessEventInfo(Function);
+
     // Froce space to login
-    if (Function->GetFullName().contains("UMG_EnterGame_C.Construct"))
+    if (EventInfo.ClientKind == EClientProcessEventKind::EnterGameConstruct)
     {
         ClientLog("[LOGIN] EnterGame Construct forcing SPACE");
 
@@ -440,7 +618,8 @@ void ProcessEventHookClient(UObject *Object, UFunction *Function, void *Parms)
                 PressSpace(); })
             .detach();
     }
-    if (Function->GetFullName().contains("UMG_EnterGame_C.BP_OnActivated"))
+
+    if (EventInfo.ClientKind == EClientProcessEventKind::EnterGameActivated)
     {
         ClientLog("[LOGIN] EnterGame Activated forcing SPACE");
 
@@ -450,14 +629,17 @@ void ProcessEventHookClient(UObject *Object, UFunction *Function, void *Parms)
                 PressSpace(); })
             .detach();
     }
+
     // Detect login complete via MainMenuBase Construct
-    if (Function->GetFullName().contains("UMG_MainMenuBase_C.Construct"))
+    if (EventInfo.ClientKind == EClientProcessEventKind::MainMenuConstruct)
     {
         LoginCompleted = true;
     }
-    if (Function->GetFullName().contains("OnConnectMatchServerTimeOut"))
+
+    if (EventInfo.ClientKind == EClientProcessEventKind::ConnectMatchServerTimeout)
     {
-        ClientLog("[PE] " + std::string(Object->GetFullName()) + " - " + std::string(Function->GetFullName()));
+        const std::string objectName = Object ? std::string(Object->GetFullName()) : "NULL";
+        ClientLog("[PE] " + objectName + " - " + EventInfo.FullName);
 
         ConnectToMatch();
     }
@@ -572,22 +754,30 @@ void InitMessageBoxHook()
 
 void InitServerHooks()
 {
-    NotifyActorDestroyed = safetyhook::create_inline((void *)(BaseAddress + 0x33403E0), NotifyActorDestroyedHook);
-    NotifyAcceptingConnection = safetyhook::create_inline((void *)(BaseAddress + 0x36CDC90), NotifyAcceptingConnectionHook);
-    NotifyControlMessage = safetyhook::create_inline((void *)(BaseAddress + 0x36CDCE0), NotifyControlMessageHook);
-    TickFlush = safetyhook::create_inline((void *)(BaseAddress + 0x33E05F0), TickFlushHook);
-    ProcessEvent = safetyhook::create_inline((void *)(BaseAddress + 0x1BCBE40), ProcessEventHook);
-    ObjectNeedsLoad = safetyhook::create_inline((void *)(BaseAddress + 0x1B7B710), ObjectNeedsLoadHook);
-    ActorNeedsLoad = safetyhook::create_inline((void *)(BaseAddress + 0x3124E70), ActorNeedsLoadHook);
-    OnFireWeaponHook = safetyhook::create_inline((void *)(BaseAddress + 0x1610500), OnFireWeapon);
-    PostLoginHook = safetyhook::create_inline((void *)(BaseAddress + 0x32903B0), PostLogin);
-    IsDedicatedServerHook = safetyhook::create_inline((void *)(BaseAddress + 0x33266F0), IsDedicatedServer);
-    IsServerHook = safetyhook::create_inline((void *)(BaseAddress + 0x3326C60), IsServer);
-    IsStandaloneHook = safetyhook::create_inline((void *)(BaseAddress + 0x3326CE0), IsStandalone);
+    const FInlineHookSpec ServerHooks[] = {
+        { "NotifyActorDestroyed", &NotifyActorDestroyed, GameOffsets::Hook::NotifyActorDestroyed, reinterpret_cast<void*>(NotifyActorDestroyedHook) },
+        { "NotifyAcceptingConnection", &NotifyAcceptingConnection, GameOffsets::Hook::NotifyAcceptingConnection, reinterpret_cast<void*>(NotifyAcceptingConnectionHook) },
+        { "NotifyControlMessage", &NotifyControlMessage, GameOffsets::Hook::NotifyControlMessage, reinterpret_cast<void*>(NotifyControlMessageHook) },
+        { "TickFlush", &TickFlush, GameOffsets::Hook::TickFlush, reinterpret_cast<void*>(TickFlushHook) },
+        { "ProcessEvent", &ProcessEvent, GameOffsets::Hook::ProcessEvent, reinterpret_cast<void*>(ProcessEventHook) },
+        { "ObjectNeedsLoad", &ObjectNeedsLoad, GameOffsets::Hook::ObjectNeedsLoad, reinterpret_cast<void*>(ObjectNeedsLoadHook) },
+        { "ActorNeedsLoad", &ActorNeedsLoad, GameOffsets::Hook::ActorNeedsLoad, reinterpret_cast<void*>(ActorNeedsLoadHook) },
+        { "OnFireWeapon", &OnFireWeaponHook, GameOffsets::Hook::OnFireWeapon, reinterpret_cast<void*>(OnFireWeapon) },
+        { "PostLogin", &PostLoginHook, GameOffsets::Hook::PostLogin, reinterpret_cast<void*>(PostLogin) },
+        { "IsDedicatedServer", &IsDedicatedServerHook, GameOffsets::Hook::IsDedicatedServer, reinterpret_cast<void*>(IsDedicatedServer) },
+        { "IsServer", &IsServerHook, GameOffsets::Hook::IsServer, reinterpret_cast<void*>(IsServer) },
+        { "IsStandalone", &IsStandaloneHook, GameOffsets::Hook::IsStandalone, reinterpret_cast<void*>(IsStandalone) },
+    };
+
+    InstallInlineHooks(ServerHooks);
 }
 
 void InitClientHook()
 {
-    ProcessEventClient = safetyhook::create_inline((void *)(BaseAddress + 0x1BCBE40), ProcessEventHookClient);
-    ClientDeathCrash = safetyhook::create_inline((void *)(BaseAddress + 0x16abe10), ClientDeathCrashHook);
+    const FInlineHookSpec ClientHooks[] = {
+        { "ProcessEventClient", &ProcessEventClient, GameOffsets::Hook::ProcessEvent, reinterpret_cast<void*>(ProcessEventHookClient) },
+        { "ClientDeathCrash", &ClientDeathCrash, GameOffsets::Hook::ClientDeathCrash, reinterpret_cast<void*>(ClientDeathCrashHook) },
+    };
+
+    InstallInlineHooks(ClientHooks);
 }

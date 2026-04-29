@@ -24,9 +24,9 @@ LibReplicate::LibReplicate(EReplicationMode ReplicationMode, void* InitListenFun
 	this->CallPreReplicationFuncPtr = (CallPreReplication)CallPreReplicationFuncPtr;
 	this->SendClientAdjustmentFuncPtr = (SendClientAdjustment)SendClientAdjustmentFuncPtr;
 
-	this->Channels = new std::vector<std::pair<UNetConnection*, std::vector<std::pair<UActorChannel*, AActor*>>>>();
-	this->SentTemporaries = new std::vector<std::pair<UNetConnection*, std::vector<AActor*>>>();
-	this->ChannelsToClose = new std::vector<UNetConnection*>();
+	this->Channels.reserve(16);
+	this->SentTemporaries.reserve(16);
+	this->ChannelsToClose.reserve(64);
 }
 
 void LibReplicate::CreateNetDriver(void* Engine, void* World, void* NetDriverName) {
@@ -63,7 +63,7 @@ void LibReplicate::Listen(void* NetDriver, void* World, EJoinMode InitialJoinMod
 
 	*Error = FString();
 
-	this-InitListenFuncPtr(NetDriver, World, URL, false, Error);
+	this->InitListenFuncPtr(NetDriver, World, URL, false, Error);
 
 	this->SetWorldFuncPtr(NetDriver, World);
 }
@@ -73,53 +73,33 @@ void LibReplicate::SetJoinMode(EJoinMode NewJoinMode) {
 }
 
 LibReplicate::UActorChannel* LibReplicate::GetChannelForActor(UNetConnection* Connection, AActor* Actor) {
-	for (auto& Pair : *(this->Channels)) {
-		if (Pair.first == Connection) {
-			for (auto& SecondPair: Pair.second) {
-				if (SecondPair.second == Actor) {
-					return SecondPair.first;
-				}
-			}
-
-			break;
-		}
+	auto connectionIt = this->Channels.find(Connection);
+	if (connectionIt == this->Channels.end()) {
+		return nullptr;
 	}
 
-	return nullptr;
+	auto actorIt = connectionIt->second.find(Actor);
+	if (actorIt == connectionIt->second.end()) {
+		return nullptr;
+	}
+
+	return actorIt->second;
 }
 
 void LibReplicate::AddActorChannelToChannels(UNetConnection* Connection, UActorChannel* ActorChannel, AActor* Actor) {
-	for (auto& Pair : *(this->Channels)) {
-		if (Pair.first == Connection) {
-			Pair.second.push_back(std::make_pair(ActorChannel, Actor));
-
-			return;
-		}
-	}
-
-	this->Channels->push_back(std::make_pair(Connection, std::vector<std::pair<UActorChannel*, AActor*>>()));
-
-	this->AddActorChannelToChannels(Connection, ActorChannel, Actor);
-
-	return;
+	this->Channels[Connection][Actor] = ActorChannel;
 }
 
 bool LibReplicate::HaveWeSentThisTemporaryActor(UNetConnection* Connection, AActor* Actor) {
-	for (auto& Pair : *(this->SentTemporaries)) {
-		if (Pair.first == Connection) {
-			for (AActor* CmpActor : Pair.second) {
-				if (CmpActor == Actor)
-					return true;
-			}
-
-			break;
-		}
+	auto connectionIt = this->SentTemporaries.find(Connection);
+	if (connectionIt == this->SentTemporaries.end()) {
+		return false;
 	}
 
-	return false;
+	return connectionIt->second.find(Actor) != connectionIt->second.end();
 }
 
-void LibReplicate::CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::vector<FPlayerControllerInfo>& PlayerControllers, std::vector<UNetConnection*>& Connections, void* ActorChannelName, UNetDriver* NetDriver) {
+void LibReplicate::CallFromTickFlushHook(const std::vector<FActorInfo>& Actors, const std::vector<FPlayerControllerInfo>& PlayerControllers, const std::vector<UNetConnection*>& Connections, void* ActorChannelName, UNetDriver* NetDriver) {
 	for (auto const& ActorInfo : Actors) {
 		this->CallPreReplicationFuncPtr(ActorInfo.ActorPtr, NetDriver);
 	}
@@ -180,40 +160,37 @@ void LibReplicate::CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::v
 	/*
 	{
 		std::scoped_lock t(this->ChannelsToCloseMutex);
-		if (!this->ChannelsToClose->empty()) {
-			while (this->ChannelsToClose->size() > 0) {
-				UActorChannel* Channel = this->ChannelsToClose->back();
+		if (!this->ChannelsToClose.empty()) {
+			while (this->ChannelsToClose.size() > 0) {
+				UActorChannel* Channel = this->ChannelsToClose.back();
 
 				this->ActorChannelCloseFuncPtr(Channel, 0);
 
-				this->ChannelsToClose->pop_back();
+				this->ChannelsToClose.pop_back();
 			}
 		}
 	}*/
 }
 
 void LibReplicate::CallWhenActorDestroyed(FActorInfo& ActorInfo) {
-	for (auto& pair : *(this->Channels)) {
-		UActorChannel* Channel = GetChannelForActor(pair.first, ActorInfo.ActorPtr);
+	for (auto& pair : this->Channels) {
+		auto channelIt = pair.second.find(ActorInfo.ActorPtr);
+		if (channelIt != pair.second.end()) {
+			UActorChannel* Channel = channelIt->second;
 
-		if (Channel) {
-			{
+			if (Channel) {
 				std::scoped_lock t(this->ChannelsToCloseMutex);
 
-				this->ChannelsToClose->push_back(Channel);
+				this->ChannelsToClose.push_back(Channel);
 			}
-		}
 
-		pair.second.erase(std::remove_if(pair.second.begin(), pair.second.end(), [ActorInfo](const std::pair<UActorChannel*, AActor*> &test) {
-			return test.second == ActorInfo.ActorPtr;
-		}), pair.second.end());
+			pair.second.erase(channelIt);
+		}
 	}
 
 	if (ActorInfo.bNetTemporary) {
-		for (auto& pair : *(this->SentTemporaries)) {
-			pair.second.erase(std::remove_if(pair.second.begin(), pair.second.end(), [ActorInfo](const AActor* test) {
-				return test == ActorInfo.ActorPtr;
-			}), pair.second.end());
+		for (auto& pair : this->SentTemporaries) {
+			pair.second.erase(ActorInfo.ActorPtr);
 		}
 	}
 }

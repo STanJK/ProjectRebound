@@ -6,6 +6,7 @@
 #include <iostream>
 
 #include "SDK.hpp"
+#include "GameOffsets.h"
 #include "Network/NetDriverAccess.h"
 #include "SDK/Engine_parameters.hpp"
 #include "SDK/ProjectBoundary_parameters.hpp"
@@ -44,7 +45,7 @@ void MainThread()
 
         BaseAddress = (uintptr_t)GetModuleHandleA(nullptr);
 
-        UC::FMemory::Init((void*)(BaseAddress + 0x18f4350));
+        UC::FMemory::Init(GameOffsets::Resolve(BaseAddress, GameOffsets::Memory::FMemoryInit));
 
         if (std::string(GetCommandLineA()).contains("-server"))
         {
@@ -55,8 +56,8 @@ void MainThread()
         {
             if (amServer)
             {
-                *(__int8*)(BaseAddress + 0x5ce2404) = 0;
-                *(__int8*)(BaseAddress + 0x5ce2405) = 1;
+                *reinterpret_cast<__int8*>(BaseAddress + GameOffsets::Memory::ServerModeFlag0) = 0;
+                *reinterpret_cast<__int8*>(BaseAddress + GameOffsets::Memory::ServerModeFlag1) = 1;
             }
         }
 
@@ -77,18 +78,18 @@ void MainThread()
             // Initialize LibReplicate exactly like original code
             libReplicate = new LibReplicate(
                 LibReplicate::EReplicationMode::Minimal,
-                (void*)(BaseAddress + 0x91AEB0),
-                (void*)(BaseAddress + 0x33A66D0),
-                (void*)(BaseAddress + 0x31F44F0),
-                (void*)(BaseAddress + 0x31F0070),
-                (void*)(BaseAddress + 0x18F1810),
-                (void*)(BaseAddress + 0x18E5490),
-                (void*)(BaseAddress + 0x36CDCE0),
-                (void*)(BaseAddress + 0x366ADB0),
-                (void*)(BaseAddress + 0x31DA270),
-                (void*)(BaseAddress + 0x33DF330),
-                (void*)(BaseAddress + 0x2fefbd0),
-                (void*)(BaseAddress + 0x3506320));
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::InitListen),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::CreateChannel),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::SetChannelActor),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::ReplicateActor),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::FMemoryMalloc),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::FMemoryFree),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::OrigNotifyControlMessage),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::CreateNamedNetDriver),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::ActorChannelClose),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::SetWorld),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::CallPreReplication),
+                GameOffsets::Resolve(BaseAddress, GameOffsets::LibReplicate::SendClientAdjustment));
             Log("[SERVER] LibReplicate initialized.");
 
             // Initialize LateJoinManager
@@ -123,7 +124,7 @@ void MainThread()
 
             InitClientHook();
 
-            //*(const wchar_t***)(BaseAddress + 0x5C63C88) = &LocalURL;
+            // Disabled LocalURL override; add a GameOffsets constant before restoring this path.
             // auto dump below
             // std::thread(ClientAutoDumpThread).detach();
             // Init Hotkey Check

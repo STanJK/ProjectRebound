@@ -1,7 +1,11 @@
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
 
 class LibReplicate {
 public:
@@ -79,11 +83,16 @@ private:
 	typedef void (*SendClientAdjustment)(AActor* PlayerController);
 
 private:
+	using FActorChannelMap = std::unordered_map<AActor*, UActorChannel*>;
+	using FConnectionChannelMap = std::unordered_map<UNetConnection*, FActorChannelMap>;
+	using FSentTemporaryMap = std::unordered_map<UNetConnection*, std::unordered_set<AActor*>>;
+
+private:
 	EReplicationMode ReplicationMode;
 	EJoinMode JoinMode;
-	std::vector<std::pair<UNetConnection*, std::vector<std::pair<UActorChannel*, AActor*>>>>* Channels;
-	std::vector<std::pair<UNetConnection*, std::vector<AActor*>>>* SentTemporaries;
-	std::vector<UActorChannel*>* ChannelsToClose;
+	FConnectionChannelMap Channels;
+	FSentTemporaryMap SentTemporaries;
+	std::vector<UActorChannel*> ChannelsToClose;
 	std::mutex ChannelsToCloseMutex;
 
 	FMemoryMalloc FMemoryMallocFuncPtr;
@@ -158,7 +167,7 @@ public:
 
 	void SetJoinMode(EJoinMode NewJoinMode);
 
-	void CallFromTickFlushHook(std::vector<FActorInfo>& Actors, std::vector<FPlayerControllerInfo>& PlayerControllers, std::vector<UNetConnection*>& Connections, void* ActorChannelName, UNetDriver* NetDriver);
+	void CallFromTickFlushHook(const std::vector<FActorInfo>& Actors, const std::vector<FPlayerControllerInfo>& PlayerControllers, const std::vector<UNetConnection*>& Connections, void* ActorChannelName, UNetDriver* NetDriver);
 
 	void CallWhenActorDestroyed(FActorInfo& Actor);
 };
