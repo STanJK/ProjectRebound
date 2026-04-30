@@ -66,6 +66,9 @@ int NumExpectedPlayers = -1;
 float MatchStartCountdown = -1.0f;
 
 std::unordered_map<APBPlayerController *, bool> PlayerRespawnAllowedMap{};
+std::unordered_set<APBPlayerController *> PlayersConfirmedRole{};
+std::unordered_set<APBPlayerController *> PendingNameUpdatePlayers{};
+std::unordered_set<APBPlayerController *> AppliedNameUpdatePlayers{};
 
 // LateJoinManager instance (constructed later in MainThread after dependencies are ready)
 LateJoinManager *gLateJoinManager = nullptr;
@@ -164,6 +167,63 @@ void HandleServerMatchEndSignal(const char *reason)
     // Keep the hook path lightweight: let the engine finish the current event,
     // then end the backend room and terminate from a detached worker.
     std::thread(DelayedExitAfterMatchEnd, shutdownReason).detach();
+}
+
+void QueuePendingPlayerNameUpdate(APBPlayerController *PlayerController)
+{
+    if (!PlayerController)
+        return;
+
+    if (AppliedNameUpdatePlayers.find(PlayerController) == AppliedNameUpdatePlayers.end())
+    {
+        PendingNameUpdatePlayers.insert(PlayerController);
+    }
+}
+
+void ApplyPendingPlayerNameUpdates(const char *reason)
+{
+    if (PendingNameUpdatePlayers.empty())
+        return;
+
+    UWorld *World = UWorld::GetWorld();
+    if (!World || !World->AuthorityGameMode)
+        return;
+
+    AGameMode *GameMode = (AGameMode *)World->AuthorityGameMode;
+    if (!GameMode)
+        return;
+
+    std::vector<APBPlayerController *> toApply;
+    toApply.reserve(PendingNameUpdatePlayers.size());
+    for (APBPlayerController *playerController : PendingNameUpdatePlayers)
+    {
+        if (playerController)
+            toApply.push_back(playerController);
+    }
+
+    for (APBPlayerController *playerController : toApply)
+    {
+        if (!playerController || !playerController->PlayerState)
+            continue;
+
+        FString playerName = playerController->PlayerState->GetPlayerName();
+        std::string nameStr = playerName.ToString();
+
+        if (nameStr.empty() || nameStr == "UserName")
+            continue;
+
+        GameMode->ChangeName(playerController, playerName, true);
+
+        if (playerController->PBPlayerState)
+        {
+            playerController->PBPlayerState->OnCustomPlayerNameChanged();
+        }
+
+        PendingNameUpdatePlayers.erase(playerController);
+        AppliedNameUpdatePlayers.insert(playerController);
+
+        std::cout << "[NAME] Applied delayed name update(" << reason << "): " << nameStr << std::endl;
+    }
 }
 
 // ======================================================

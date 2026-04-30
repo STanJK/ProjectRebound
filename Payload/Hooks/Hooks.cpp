@@ -403,6 +403,12 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
                             PlayerJoinTimerSelectFuck = 5.0f;
 
                             NumExpectedPlayers = NumPlayersJoined;
+                            NumPlayersSelectedRole = 0;
+                            canStartMatch = false;
+                            StartMatchTimer = -1.0f;
+                            PlayersConfirmedRole.clear();
+                            PendingNameUpdatePlayers.clear();
+                            AppliedNameUpdatePlayers.clear();
                         }
                     }
                 }
@@ -543,6 +549,8 @@ void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
                                                       ? (APBPlayerController *)Object
                                                       : nullptr;
 
+        QueuePendingPlayerNameUpdate(PBPlayerController);
+
         if (gLateJoinManager && gLateJoinManager->IsLateJoinPlayer(PBPlayerController))
         {
             // Execute original function first
@@ -552,16 +560,56 @@ void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
             return;
         }
 
-        NumPlayersSelectedRole++;
-
-        if (!canStartMatch && NumPlayersSelectedRole >= NumExpectedPlayers)
+        if (gLateJoinManager && gLateJoinManager->IsInitialJoinPlayer(PBPlayerController))
         {
-            canStartMatch = true;
+            ProcessEvent.call(Object, Function, Parms);
+            gLateJoinManager->OnRoleConfirmed(PBPlayerController);
+
+            if (PBPlayerController)
+            {
+                const auto [_, inserted] = PlayersConfirmedRole.insert(PBPlayerController);
+                if (inserted)
+                {
+                    NumPlayersSelectedRole = static_cast<int>(PlayersConfirmedRole.size());
+                    std::cout << "[MATCH] Role confirmed by (initial-join) "
+                        << PBPlayerController->GetFullName()
+                        << " (" << NumPlayersSelectedRole << "/" << NumExpectedPlayers << ")" << std::endl;
+                }
+
+                if (!canStartMatch && NumExpectedPlayers > 0 && NumPlayersSelectedRole >= NumExpectedPlayers)
+                {
+                    canStartMatch = true;
+                }
+            }
+            return;
+        }
+
+        if (PBPlayerController)
+        {
+            const auto [_, inserted] = PlayersConfirmedRole.insert(PBPlayerController);
+            if (inserted)
+            {
+                NumPlayersSelectedRole = static_cast<int>(PlayersConfirmedRole.size());
+                std::cout << "[MATCH] Role confirmed by "
+                    << PBPlayerController->GetFullName()
+                    << " (" << NumPlayersSelectedRole << "/" << NumExpectedPlayers << ")" << std::endl;
+            }
+            else
+            {
+                std::cout << "[MATCH] Ignoring duplicate role confirmation from "
+                    << PBPlayerController->GetFullName() << std::endl;
+            }
+
+            if (!canStartMatch && NumExpectedPlayers > 0 && NumPlayersSelectedRole >= NumExpectedPlayers)
+            {
+                canStartMatch = true;
+            }
         }
     }
 
     if (EventInfo.ServerKind == EServerProcessEventKind::ReadyToMatchIntroWaitingToStart)
     {
+        ApplyPendingPlayerNameUpdates("ReadyToMatchIntro_WaitingToStart");
         if (!canStartMatch)
         {
             return;
@@ -604,7 +652,16 @@ void *PostLogin(AGameMode *GameMode, APBPlayerController *PC)
         return Ret;
     }
 
-    // Force first-life respawn fix
+    // Initial join: defer Pawn creation to LateJoinManager's delayed-spawn flow.
+    // This ensures weapons are created after role confirmation instead of being
+    // locked to the engine's default first-spawn timing.
+    if (gLateJoinManager)
+    {
+        gLateJoinManager->QueueInitialJoinPlayer(GameMode, PC);
+        return Ret;
+    }
+
+    // Fallback: if LateJoinManager is not available, use the old immediate-respawn path
     if (PC && PC->Pawn)
     {
         PC->ServerSuicide(0); // triggers respawn

@@ -58,6 +58,7 @@ public:
         float ElapsedSeconds = 0.0f;    // 当前阶段已持续时间（秒）
         int   SpawnAttempts   = 0;      // 已尝试生成的次数（最多 3 次）
         bool  ClientStartSent = false;   // 是否已发送 ClientStart 序列
+        bool  bIsInitialJoin  = false;   // 是否为初始加入（比赛未开始时连接）
     };
 
     // ------------------------------------------------------------------
@@ -90,6 +91,13 @@ public:
     // @return true 表示已作为中途加入处理，调用方应跳过正常首生逻辑
     bool OnPostLogin(SDK::AGameMode* GameMode, SDK::APBPlayerController* PC);
 
+    // @brief PostLogin Hook 中调用。将初始加入玩家注册到与中途加入一致的流程。
+    //        初始加入也会经过 ClientStart 序列与延迟 Pawn 生成路径，
+    //        以统一客户端状态推进与 UI 生命周期。
+    // @param GameMode  当前 GameMode
+    // @param PC        新连接的 PlayerController
+    void QueueInitialJoinPlayer(SDK::AGameMode* GameMode, SDK::APBPlayerController* PC);
+
     // @brief ProcessEvent Hook 中调用。拦截角色选择相关的 RPC。
     //        仅处理 CanPlayerSelectRole / CanSelectRole（强制返回 true）。
     //        ServerConfirmRoleSelection 需要调用方先执行原函数再用 OnRoleConfirmed 推进状态，
@@ -116,10 +124,29 @@ public:
     // @brief 查询指定 PC 是否为中途加入玩家（供其他系统判断）
     bool IsLateJoinPlayer(SDK::APBPlayerController* PC) const;
 
+    // @brief 查询指定 PC 是否为初始加入玩家（注册到延迟生成流程但比赛未开始时连接）
+    bool IsInitialJoinPlayer(SDK::APBPlayerController* PC) const;
+
     // @brief 查询中途加入窗口是否开放（比赛已开始或回合进行中）
     bool IsLateJoinWindowOpen() const;
 
 private:
+    // ------------------------------------------------------------------
+    //  私有类型 — 客户端状态同步配置
+    // ------------------------------------------------------------------
+
+    struct FClientSyncOptions
+    {
+        bool SendStartOnlineGame = false;
+        bool SendMatchHasStarted = false;
+        bool SendRoundHasStarted = false;
+        bool SendNotifyGameStarted = false;
+        bool SendClientSelectRole = false;
+        bool SendReadyAtStartSpot = false;
+        bool SendGotoPlaying = false;
+        bool SendRestartAndAcknowledge = false;
+    };
+
     // ------------------------------------------------------------------
     //  外部依赖（引用，不拥有）
     // ------------------------------------------------------------------
@@ -158,6 +185,7 @@ private:
     // ------------------------------------------------------------------
 
     void QueueLateJoinPlayer(SDK::APBPlayerController* PC);
+    void SyncClientJoinState(SDK::APBPlayerController* PC, const FClientSyncOptions& Options);
     void SendLateJoinClientStart(SDK::APBPlayerController* PC);
     void PrepareLateJoinRespawn(SDK::APBPlayerController* PC);
     void FinalizeLateJoinSpawn(SDK::APBPlayerController* PC);
