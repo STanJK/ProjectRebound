@@ -49,6 +49,17 @@ void InitClientArmory()
 
 void ConnectToMatch()
 {
+    std::string target;
+    {
+        std::lock_guard<std::mutex> lock(MatchIPMutex);
+        if (MatchIP.empty())
+        {
+            ClientLog("[CLIENT] Reconnect requested but no -match target is configured.");
+            return;
+        }
+        target = MatchIP;
+    }
+
     UPBGameInstance *GameInstance =
         (UPBGameInstance *)UWorld::GetWorld()->OwningGameInstance;
 
@@ -59,8 +70,11 @@ void ConnectToMatch()
 
     LocalPlayer->GoToRange(0.0f);
 
+    std::wstring travelCmd = L"travel " + std::wstring(target.begin(), target.end());
+    ClientLog("[CLIENT] Reconnecting to match: " + target);
+
     UKismetSystemLibrary::ExecuteConsoleCommand(
-        UWorld::GetWorld(), L"travel 127.0.0.1", nullptr);
+        UWorld::GetWorld(), travelCmd.c_str(), nullptr);
 
     GameInstance->ShowLoadingScreen(true, true);
 }
@@ -110,8 +124,20 @@ void AutoConnectToMatchFromCmdline()
                     Sleep(200);
 
                     // Connect to match
-                    std::wstring wcmd = L"open " + std::wstring(MatchIP.begin(), MatchIP.end());
-                    ClientLog("[CLIENT] Auto-connecting to match: " + MatchIP);
+                    std::string target;
+                    {
+                        std::lock_guard<std::mutex> lock(MatchIPMutex);
+                        target = MatchIP;
+                    }
+
+                    if (target.empty())
+                    {
+                        ClientLog("[CLIENT] Auto-connect requested but no -match target is configured.");
+                        return;
+                    }
+
+                    std::wstring wcmd = L"open " + std::wstring(target.begin(), target.end());
+                    ClientLog("[CLIENT] Auto-connecting to match: " + target);
 
                     UKismetSystemLibrary::ExecuteConsoleCommand(
                         UWorld::GetWorld(),

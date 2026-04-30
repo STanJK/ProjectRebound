@@ -16,16 +16,25 @@
     <Filter Include="safetyhook">
       <UniqueIdentifier>{d20c55c4-be16-4397-8447-83ec7e9e0d87}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Communication">
+      <UniqueIdentifier>{a1b2c3d4-e5f6-7890-abcd-ef1234567890}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="GameOffsets.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Communication\CommandFramework.h">
+      <Filter>Communication</Filter>
     </ClInclude>
     <ClInclude Include="framework.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="Communication\CommandFramework.cpp">
+      <Filter>Communication</Filter>
+    </ClCompile>
     <ClCompile Include="dllmain.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

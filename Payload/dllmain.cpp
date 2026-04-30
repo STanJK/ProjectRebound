@@ -4,6 +4,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <mutex>
 
 #include "SDK.hpp"
 #include "GameOffsets.h"
@@ -14,6 +15,7 @@
 #include "Libs/json.hpp"
 #include "Replication/libreplicate.h"
 #include "ServerLogic/LateJoinManager.h"
+#include "Communication/CommandFramework.h"
 
 #include "Config/Config.h"
 #include "Debug/Debug.h"
@@ -30,6 +32,27 @@ using namespace SDK;
 
 uintptr_t BaseAddress = 0x0;
 LibReplicate* libReplicate = nullptr; // was static in original, but extern needed by other modules
+static CommandFramework* g_CmdFramework = nullptr;
+
+void OnJoinFromPipe(const std::string& ip, const std::string& token)
+{
+    (void)token;
+
+    ClientLog("[PIPE] Join request received: " + ip);
+    {
+        std::lock_guard<std::mutex> lock(MatchIPMutex);
+        MatchIP = ip;
+    }
+
+    if (UWorld::GetWorld() && UWorld::GetWorld()->OwningGameInstance)
+    {
+        ConnectToMatch();
+    }
+    else
+    {
+        AutoConnectToMatchFromCmdline();
+    }
+}
 
 // ======================================================
 //  SECTION 15 — MAIN THREAD (ENTRY LOGIC)
@@ -137,7 +160,21 @@ void MainThread()
             }
 
             InitClientArmory();
-            if (!MatchIP.empty())
+            if (!MatchPipeName.empty())
+            {
+                g_CmdFramework = new CommandFramework();
+                g_CmdFramework->SetPipeName(MatchPipeName);
+                g_CmdFramework->SetJoinCallback(OnJoinFromPipe);
+                g_CmdFramework->SetLogCallback([](const std::string& msg) { ClientLog(msg); });
+                g_CmdFramework->Start();
+            }
+
+            bool hasInitialMatchTarget = false;
+            {
+                std::lock_guard<std::mutex> lock(MatchIPMutex);
+                hasInitialMatchTarget = !MatchIP.empty();
+            }
+            if (hasInitialMatchTarget)
             {
                 AutoConnectToMatchFromCmdline();
             }

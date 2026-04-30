@@ -13,6 +13,8 @@ std::string HostToken = "";
 
 // IP from the server browser
 std::string MatchIP = "";
+std::string MatchPipeName = "";
+std::mutex MatchIPMutex;
 
 ServerConfig Config{};
 bool amServer = false;
@@ -135,8 +137,17 @@ void LoadClientConfig()
     std::string matchArg = GetCmdValue("-match=");
     if (!matchArg.empty())
     {
-        MatchIP = matchArg;
-        ClientLog("[CLIENT] Auto-match target: " + MatchIP);
+        {
+            std::lock_guard<std::mutex> lock(MatchIPMutex);
+            MatchIP = matchArg;
+        }
+        ClientLog("[CLIENT] Auto-match target: " + matchArg);
+    }
+
+    MatchPipeName = GetCmdValue("-pipe=");
+    if (!MatchPipeName.empty())
+    {
+        ClientLog("[CLIENT] Command pipe name: " + MatchPipeName);
     }
 
     // NEW: debug log flag

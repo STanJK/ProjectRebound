@@ -1,6 +1,7 @@
 // Config.h
 #pragma once
 #include <string>
+#include <mutex>
 
 struct ServerConfig
 {
@@ -23,6 +24,8 @@ extern std::string HostToken;
 
 // IP from the server browser
 extern std::string MatchIP;
+extern std::string MatchPipeName;
+extern std::mutex MatchIPMutex;
 
 extern ServerConfig Config;
 extern bool amServer;
