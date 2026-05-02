@@ -264,7 +264,8 @@ namespace
                     continue;
                 }
 
-                Batch.ActorInfos.emplace_back(actor, actor->bNetTemporary);
+                const bool isNetTemporary = actor->bNetTemporary != 0;
+                Batch.ActorInfos.emplace_back(actor, isNetTemporary);
             }
         }
     }
@@ -459,7 +460,8 @@ bool NotifyActorDestroyedHook(UWorld *World, AActor *Actor, bool SomeShit, bool 
 
     if (listening)
     {
-        LibReplicate::FActorInfo ActorInfo = LibReplicate::FActorInfo((void *)Actor, Actor->bNetTemporary);
+        const bool isNetTemporary = Actor->bNetTemporary != 0;
+        LibReplicate::FActorInfo ActorInfo = LibReplicate::FActorInfo((void *)Actor, isNetTemporary);
 
         libReplicate->CallWhenActorDestroyed(ActorInfo);
     }
