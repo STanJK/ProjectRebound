@@ -145,10 +145,12 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="GameOffsets.h" />
+    <ClInclude Include="Communication\CommandFramework.h" />
     <ClInclude Include="framework.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="ClientLogic\ClientLogic.cpp" />
+    <ClCompile Include="Communication\CommandFramework.cpp" />
     <ClCompile Include="Config\Config.cpp" />
     <ClCompile Include="Debug\Debug.cpp" />
     <ClCompile Include="dllmain.cpp" />
