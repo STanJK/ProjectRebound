@@ -44,7 +44,76 @@ const TCP_HANDSHAKE_ECHO_HEX = "000000022f2f";
 
 const DATA_DIR = path.join(__dirname, "data");
 const LOG_DIR = path.join(__dirname, "logs");
-const ARCHIVE_PATH = path.join(DATA_DIR, "role-archive.json");
+
+// ---- Per-player archive paths ----
+
+/** Map gateToken → playerId (populated by /connectServer, consumed by TCP handshake). */
+const gateTokenToPlayerId = new Map();
+
+function getArchivePath(playerId) {
+  return path.join(DATA_DIR, `${playerId}.json`);
+}
+
+function buildDefaults(specs) {
+  const roles = {};
+  for (const [roleId, s] of Object.entries(specs)) {
+    const up = roleId.toUpperCase();
+    roles[roleId] = {
+      RoleID: roleId,
+      PrimaryWeapon: s.PW,
+      SecondWeapon: s.SW,
+      LeftPylon: s.LP,
+      MeleeWeapon: "MELEE-KNIFE",
+      MobilityModule: up + "_FCM-GRAPPLE",
+      _SkinBase: up + "_ORIGINAL",
+      _SkinPaint: up + "_ORIGINAL_PTOriginal",
+      _Cosmetic9: s.C9,
+      _Cosmetic10: "HONONE",
+    };
+  }
+  return roles;
+}
+
+const DEFAULT_ROLES = buildDefaults({
+  PEACE:  { PW:"PEACE_RU-AKM",    SW:"PEACE_RU-APS",   LP:"PEACE_TAC-EMP",       C9:"ABGOrlanDefault" },
+  PROBE:  { PW:"PROBE_GSW-DMR",   SW:"PROBE_GSW-FOP",  LP:"PROBE_MISSILE-HIVE",   C9:"ABGProbeDefault" },
+  Sniper: { PW:"SNIPER_GSW-PSR",  SW:"SNIPER_GSW-CDP", LP:"SNIPER_INFO-SNAPSHOT", C9:"ABGYangDefault"   },
+  FORT:   { PW:"FORT_GSW-MG",     SW:"FORT_GSW-IDW",   LP:"FORT_TAC-ADS",         C9:"ABGFortDefault"   },
+  FIXER:  { PW:"FIXER_GSW-PCC",   SW:"FIXER_GSW-FOP",  LP:"FIXER_TAC-MED",         C9:"ABGDocDefault"   },
+  SPIKE:  { PW:"SPIKE_GSW-SG",    SW:"SPIKE_GSW-IDW",  LP:"SPIKE_SMK-SQUID",       C9:"ABGSpikeDefault"  },
+});
+
+function loadArchiveFor(playerId) {
+  const p = getArchivePath(playerId);
+  try {
+    if (!fs.existsSync(p)) {
+      const archive = JSON.parse(JSON.stringify(DEFAULT_ROLES));
+      saveArchiveFor(playerId, archive);
+      logger.info(`[PERSIST] Initialized 6-role defaults for new player ${playerId}`);
+      return archive;
+    }
+    const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+    const roles = raw && raw.roles && typeof raw.roles === "object" ? raw.roles : {};
+    logger.info(`[PERSIST] Loaded ${Object.keys(roles).length} roles for ${playerId}`);
+    return roles;
+  } catch (e) {
+    logger.error(`[PERSIST] Load failed for ${playerId}:`, e.message);
+    return {};
+  }
+}
+
+function saveArchiveFor(playerId, archive) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      getArchivePath(playerId),
+      JSON.stringify({ savedAt: new Date().toISOString(), roles: archive }, null, 2),
+      "utf8"
+    );
+  } catch (e) {
+    logger.error(`[PERSIST] Save failed for ${playerId}:`, e.message);
+  }
+}
 
 const PROTO_REQUEST_WRAPPER = "./game/proto/Request/RequestWrapper.proto";
 const PROTO_RESPONSE_WRAPPER = "./game/proto/Response/ResponseWrapper.proto";
@@ -131,8 +200,8 @@ const objectOptions = {
 
 let partyPresence = "InMatching";
 
-/** @type {Record<string, object>} */
-let roleArchive = {};
+/** Per-socket role archive cache. Pinned by gateToken echo handshake. */
+// (was: let roleArchive = {}; — now lives on socket._roleArchive)
 
 // -----------------------------------------------------------------------------
 //  Logger
@@ -304,42 +373,14 @@ function toBuffer(bytes) {
   }
 }
 
-// ---- role-archive.json I/O ----
+// ---- Per-player role archive helpers ----
 
-function loadArchive() {
-  try {
-    if (!fs.existsSync(ARCHIVE_PATH)) {
-      roleArchive = {};
-      return;
-    }
-    const raw = JSON.parse(fs.readFileSync(ARCHIVE_PATH, "utf8"));
-    roleArchive = raw && raw.roles && typeof raw.roles === "object" ? raw.roles : {};
-    logger.info(`[PERSIST] Loaded ${Object.keys(roleArchive).length} roles`);
-  } catch (e) {
-    logger.error("[PERSIST] Load failed:", e.message);
-    roleArchive = {};
+function ensureRoleEntry(archive, roleId) {
+  if (!archive[roleId] || typeof archive[roleId] !== "object") {
+    archive[roleId] = { RoleID: roleId };
   }
-}
-
-function saveArchive() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(
-      ARCHIVE_PATH,
-      JSON.stringify({ savedAt: new Date().toISOString(), roles: roleArchive }, null, 2),
-      "utf8"
-    );
-  } catch (e) {
-    logger.error("[PERSIST] Save failed:", e.message);
-  }
-}
-
-function ensureRoleEntry(roleId) {
-  if (!roleArchive[roleId] || typeof roleArchive[roleId] !== "object") {
-    roleArchive[roleId] = { RoleID: roleId };
-  }
-  roleArchive[roleId].RoleID = roleId;
-  return roleArchive[roleId];
+  archive[roleId].RoleID = roleId;
+  return archive[roleId];
 }
 
 // ---- SkinConfig encoding (field 8) ----
@@ -410,13 +451,13 @@ function encodeWeaponConfig(stored) {
 
 // ---- Build PlayerRoleData for GetPlayerArchiveV2 response ----
 
-function buildPlayerRoleData(roleId) {
+function buildPlayerRoleData(archive, roleId) {
   // Case-insensitive lookup (game sends "Sniper", we may store "SNIPER")
   const lookupId =
-    roleId in roleArchive
+    roleId in archive
       ? roleId
-      : Object.keys(roleArchive).find((k) => k.toLowerCase() === roleId.toLowerCase());
-  const stored = lookupId ? roleArchive[lookupId] : null;
+      : Object.keys(archive).find((k) => k.toLowerCase() === roleId.toLowerCase());
+  const stored = lookupId ? archive[lookupId] : null;
 
   const out = { RoleID: roleId };
   if (!stored) return out;
@@ -542,11 +583,14 @@ function extractWeaponIdFromArchiveBlob(blob) {
 
 // ---- RPC request handlers (mutate roleArchive) ----
 
-function handleUpdateRoleArchive(messageBytes) {
-  const req = parseUpdateRoleArchiveRequest(messageBytes);
+function handleUpdateRoleArchive(ctx) {
+  const req = parseUpdateRoleArchiveRequest(ctx.messageBytes);
   if (!req.roleId) return;
 
-  const entry = ensureRoleEntry(req.roleId);
+  const archive = ctx.socket._roleArchive;
+  if (!archive) { logger.warn("[PERSIST] No archive on socket — gateToken not resolved"); return; }
+
+  const entry = ensureRoleEntry(archive, req.roleId);
   const field = SLOT_TO_FIELD[req.slot];
 
   if (field && req.itemId) {
@@ -561,24 +605,27 @@ function handleUpdateRoleArchive(messageBytes) {
     logger.info(`[PERSIST] ${req.roleId} cosmetic #${req.slot} = ${req.itemId}`);
   }
 
-  saveArchive();
+  saveArchiveFor(ctx.socket._playerId, archive);
 }
 
-function handleUpdateWeaponArchive(messageBytes) {
-  const req = parseUpdateWeaponArchiveRequest(messageBytes);
+function handleUpdateWeaponArchive(ctx) {
+  const req = parseUpdateWeaponArchiveRequest(ctx.messageBytes);
   if (!req.roleId || !req.weaponArchiveBlob || req.weaponArchiveBlob.length === 0) return;
+
+  const archive = ctx.socket._roleArchive;
+  if (!archive) { logger.warn("[PERSIST] No archive on socket — gateToken not resolved"); return; }
 
   const weaponId = extractWeaponIdFromArchiveBlob(req.weaponArchiveBlob);
   if (!weaponId) return;
 
-  const entry = ensureRoleEntry(req.roleId);
+  const entry = ensureRoleEntry(archive, req.roleId);
   if (!entry[WEAPON_CONFIG_KEY]) entry[WEAPON_CONFIG_KEY] = {};
   entry[WEAPON_CONFIG_KEY][weaponId] = req.weaponArchiveBlob.toString("base64");
 
   logger.info(
     `[PERSIST] ${req.roleId}.${weaponId} weapon archive (${req.weaponArchiveBlob.length}B)`
   );
-  saveArchive();
+  saveArchiveFor(ctx.socket._playerId, archive);
 }
 
 // ---- Hex diagnostic logger (disabled in production) ----
@@ -604,9 +651,7 @@ function logLoadoutHex({ rpcPath, messageId, messageBytes, frameBytes, extra }) 
   fs.appendFileSync(logPath, lines.join("\n"), "utf8");
 }
 
-// ---- Initialize persistence ----
-
-loadArchive();
+// ---- Per-player persistence: archives loaded on gateToken handshake ----
 
 // =============================================================================
 //  HTTP (Express)
@@ -649,11 +694,14 @@ app.post("/connectServer", (req, res) => {
     version,
   });
 
+  const gateToken = crypto.randomUUID().toString();
+  gateTokenToPlayerId.set(gateToken, playerId);
+
   res.status(200).json({
     error: 0,
     userId: playerId,
     aceId: "test",
-    gateToken: TEST_GATE_TOKEN,
+    gateToken: gateToken,
     endpoint: RPC_ENDPOINT,
   });
 });
@@ -661,8 +709,9 @@ app.post("/connectServer", (req, res) => {
 // ---- HTTP API for DLL LoadoutFix client ----
 
 app.get("/api/loadout/:playerId", (req, res) => {
+  const archive = loadArchiveFor(req.params.playerId);
   const roles = {};
-  for (const [roleId, stored] of Object.entries(roleArchive)) {
+  for (const [roleId, stored] of Object.entries(archive)) {
     if (!stored || typeof stored !== "object") continue;
     roles[roleId] = {
       primaryWeapon: stored.PrimaryWeapon || null,
@@ -686,12 +735,23 @@ app.get("/api/loadout/:playerId", (req, res) => {
 // =============================================================================
 
 function handleGateTokenEcho(ctx) {
-  // Client echoes gateToken as RPCPath during handshake — reflect the raw frame
+  // Client echoes gateToken as RPCPath during handshake.
+  // The RPCPath IS the gateToken string. Look up the playerId, load their archive.
+  const token = ctx.rpcPath;
+  const playerId = gateTokenToPlayerId.get(token);
+  if (playerId) {
+    ctx.socket._playerId = playerId;
+    ctx.socket._roleArchive = loadArchiveFor(playerId);
+    gateTokenToPlayerId.delete(token); // one-shot
+    logger.info(`[AUTH] Socket bound to playerId=${playerId}`);
+  } else {
+    logger.warn(`[AUTH] Unrecognized gateToken: ${token.substring(0, 36)}`);
+  }
   ctx.socket.write(ctx.frameBytes);
 }
 
 function handleUpdateRoleArchiveV2(ctx) {
-  handleUpdateRoleArchive(ctx.messageBytes);
+  handleUpdateRoleArchive(ctx);
   logLoadoutHex({
     rpcPath: ctx.rpcPath,
     messageId: ctx.messageId,
@@ -706,7 +766,7 @@ function handleUpdateRoleArchiveV2(ctx) {
 }
 
 function handleUpdateWeaponArchiveV2(ctx) {
-  handleUpdateWeaponArchive(ctx.messageBytes);
+  handleUpdateWeaponArchive(ctx);
   logLoadoutHex({
     rpcPath: ctx.rpcPath,
     messageId: ctx.messageId,
@@ -730,20 +790,22 @@ function handleGetPlayerArchiveV2(ctx) {
     ctx.messageBytes
   );
   const roleIds = reqObj.RoleIDs || [];
+  const archive = ctx.socket._roleArchive || {};
+  const playerId = ctx.socket._playerId || "unknown";
 
   logLoadoutHex({
     rpcPath: ctx.rpcPath,
     messageId: ctx.messageId,
     messageBytes: ctx.messageBytes,
     frameBytes: ctx.frameBytes,
-    extra: { RoleIDs: roleIds },
+    extra: { RoleIDs: roleIds, playerId },
   });
 
   // Codec sub_1409D3CE0: field 1 (0x0a) = repeated RoleArchiveDataV2, field 2 (0x10) = varint.
   // Field 2 omitted when PlayerLevel=0 (proto3 default).
   const responseObj = { PlayerRoleDatas: [], PlayerLevel: 0 };
   for (const roleId of roleIds) {
-    responseObj.PlayerRoleDatas.push(buildPlayerRoleData(roleId));
+    responseObj.PlayerRoleDatas.push(buildPlayerRoleData(archive, roleId));
   }
 
   const responseBytes = encodeProtoMessage(
@@ -758,7 +820,7 @@ function handleGetPlayerArchiveV2(ctx) {
     messageId: ctx.messageId,
     messageBytes: responseBytes,
     frameBytes: responseFrame,
-    extra: { RoleIDs: roleIds, source: "role-archive.json" },
+    extra: { RoleIDs: roleIds, playerId, source: getArchivePath(playerId) },
   });
   ctx.socket.write(responseFrame);
 }
@@ -969,7 +1031,6 @@ function handleQueryCurrency(ctx) {
 }
 
 const rpcHandlers = {
-  [TEST_GATE_TOKEN]: handleGateTokenEcho,
   "/assets.Assets/UpdateRoleArchiveV2": handleUpdateRoleArchiveV2,
   "/assets.Assets/UpdateWeaponArchiveV2": handleUpdateWeaponArchiveV2,
   "/assets.Assets/GetPlayerArchiveV2": handleGetPlayerArchiveV2,
@@ -989,6 +1050,12 @@ const rpcHandlers = {
 };
 
 function dispatchRpc(ctx) {
+  // GateToken echo: dynamic UUID tokens resolve the socket's player identity
+  if (gateTokenToPlayerId.has(ctx.rpcPath)) {
+    handleGateTokenEcho(ctx);
+    return;
+  }
+
   const handler = rpcHandlers[ctx.rpcPath];
   if (!handler) {
     logger.info("[RECV] Undefined Message:", { path: ctx.rpcPath, MessageId: ctx.messageId });
