@@ -1,1117 +1,1184 @@
-const express = require('express');
-const bodyParser = require('body-parser');
+// =============================================================================
+//  Boundary MetaServer — reverse-engineered game backend
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+//  Dependencies
+// -----------------------------------------------------------------------------
+
+const express = require("express");
+const bodyParser = require("body-parser");
+const net = require("net");
+const protobuf = require("protobufjs");
+const crypto = require("crypto");
+const fs = require("fs");
+const path = require("path");
+const udp = require("dgram");
+const { serialize } = require("v8"); // retained (present in original)
+
+// -----------------------------------------------------------------------------
+//  Constants
+// -----------------------------------------------------------------------------
+
+const HTTP_PORT = process.env.PORT || 8000;
+const RPC_PORT = 6969;
+const MATCHMAKING_PORT = 9000;
+const MATCHMAKING_HOST = "127.0.0.1";
+
+// Gate/handshake token echoed by the client after /connectServer
+const TEST_GATE_TOKEN =
+  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30";
+
+const RPC_ENDPOINT = `${MATCHMAKING_HOST}:${RPC_PORT}`;
+
+// UDP QoS probe bytes (matchmaking)
+const QOS_REQUEST_BYTE = 0x59;
+const QOS_RESPONSE_BYTE = 0x95;
+
+// Length-prefixed TCP framing: 4-byte BE length + payload
+const TCP_LENGTH_HEADER_SIZE = 4;
+const MAX_TCP_FRAME_PAYLOAD = 16 * 1024 * 1024;
+
+// Raw echo frame seen during early connection (length=2, payload="//")
+const TCP_HANDSHAKE_ECHO_HEX = "000000022f2f";
+
+const DATA_DIR = path.join(__dirname, "data");
+const LOG_DIR = path.join(__dirname, "logs");
+const ARCHIVE_PATH = path.join(DATA_DIR, "role-archive.json");
+
+const PROTO_REQUEST_WRAPPER = "./game/proto/Request/RequestWrapper.proto";
+const PROTO_RESPONSE_WRAPPER = "./game/proto/Response/ResponseWrapper.proto";
+const PROTO_JSON_RESPONSE_WRAPPER = "./game/proto/Response/JSONResponseWrapper.proto";
+
+const TEMP_USER_ID = "76561198211631084";
+
+// UpdateRoleArchiveV2 slot enum → PlayerRoleData field name
+const SLOT_TO_FIELD = {
+  1: "PrimaryWeapon",
+  2: "SecondWeapon",
+  3: "MeleeWeapon",
+  4: "MobilityModule",
+  5: "LeftPylon",
+  6: "RightPylon",
+};
+
+// Internal store keys for non-weapon data
+const SKIN_BASE_KEY = "_SkinBase";
+const SKIN_PAINT_KEY = "_SkinPaint";
+const COSMETIC_KEY_PREFIX = "_Cosmetic";
+const WEAPON_CONFIG_KEY = "_WeaponConfigs";
+
+const PATCHNOTES_4012026_TEXT =
+  "Welcome to the second round of patchnotes! Most of this is bugfix-focused, and those fixes might not even work yet! Fun!\n\nNew Features:\n- PvE Match Support! This should (theoretically) allow you to take on Hard bots, either solo or CoOp! This still has to be hosted, but we might run some at some point!\n- Randomized map selection, from all available Boundary maps!\n- Proper TDM mode setup, first to 75 kills wins, should last 10 min!\n\nBugfixes:\n- HOPEFULLY fixed the 999/999 spawn bug, though we're gonna have to confirm this in a second to see if I actually fixed it or not!\n- Fixed up the logic server a little bit to make it somewhat more reliable, shouldn't crash as often now\n\nThat's it for today, hope y'all enjoy!";
+
+const PATCHNOTES_3312026_TEXT =
+  "Welcome to the first round of patches for Project Rebound!\nNew Features:\n- Basic emulation of the Logic Server. This allows you to see the news (hi), adjust settings, and not have to reboot the game for every match\n- In-Game Medals & Scoring! Go for those headshots :)\nBugfixes:\n- Fixed several bugs causing respawning early to softlock the game. There is still one more bug I'm working out here, but there should already be improvement here.\n- Upgraded to 128 tick servers! This might get reverted if horrific things happen, but for now enjoy 128tick Boundary!\n- Various optimizations to backend tech, should make your matches significantly more stable!";
+
+const ALPHA_TEXT =
+  "Welcome to the Project Rebound Alpha. Please be patient and respectful to me & your fellow playtesters. Matchmaking will prioritize short queues over full matches, so feel free to coordinate in the discord to get games going.";
+
+const PLAYLISTS_JSON = {
+  PVP: [
+    {
+      Name: "Playtest",
+      Title: [{ en: "Playtest" }],
+      Description: [, { en: "Playtest a very early version of Project Rebound" }],
+      SecondaryDescription: [
+        { en: "Please report any bugs to @systemdev in the Boundary discord" },
+      ],
+      BigTitle: [{ en: "Playtest" }],
+      BigDescription: [{ en: "Playtest a very early version of Project Rebound" }],
+      PlotImage: [{ zh: "Capture" }, { en: "Capture" }],
+      LargePlotImage: [{ zh: "Capture" }, { en: "Capture" }],
+      GameModeList: ["Purge"],
+      bHasFilter: false,
+      bIsLive: true,
+      Priority: 1,
+      StartTime: 0,
+      StopTime: 0,
+    },
+  ],
+};
+
+const matchmakingUDPServerDiscoveryPayload = {
+  servers: [
+    {
+      location_id: 6,
+      region_id: "336d1f3e-3ecb-11eb-a7dc-3b7705f20f56",
+      ipv4: MATCHMAKING_HOST,
+      ipv6: "",
+      port: MATCHMAKING_PORT,
+    },
+    {
+      location_id: 10,
+      region_id: "11111111-2222-4333-8444-555555555501",
+      ipv4: MATCHMAKING_HOST,
+      ipv6: "",
+      port: MATCHMAKING_PORT,
+    },
+  ],
+};
+
+// protobufjs toObject options — keep identical to original
+const objectOptions = {
+  Enums: String, // enums as string names
+  longs: String, // longs as strings (requires long.js)
+  defaults: true, // includes default values
+  arrays: true, // populates empty arrays (repeated fields) even if defaults=false
+  objects: true, // populates empty objects (map fields) even if defaults=false
+  oneofs: true, // includes virtual oneof fields set to the present field's name);
+};
+
+let partyPresence = "InMatching";
+
+/** @type {Record<string, object>} */
+let roleArchive = {};
+
+// -----------------------------------------------------------------------------
+//  Logger
+// -----------------------------------------------------------------------------
+
+const logger = {
+  info: (...args) => console.log(...args),
+  warn: (...args) => console.warn(...args),
+  error: (...args) => console.error(...args),
+  debug: (...args) => console.log(...args),
+};
+
+// -----------------------------------------------------------------------------
+//  Protobuf type cache + response helpers
+// -----------------------------------------------------------------------------
+
+const protoTypeCache = new Map();
+
+function loadProtoType(protoPath, typeName) {
+  const key = `${protoPath}\0${typeName}`;
+  let type = protoTypeCache.get(key);
+  if (!type) {
+    const root = protobuf.loadSync(protoPath);
+    type = root.lookupType(typeName);
+    protoTypeCache.set(key, type);
+  }
+  return type;
+}
+
+function wrapResponse(messageId, rpcPath, responseBytes) {
+  const responseWrapperType = loadProtoType(
+    PROTO_RESPONSE_WRAPPER,
+    "ProjectBoundary.ResponseWrapper"
+  );
+  const responseWrapper = responseWrapperType.create({
+    MessageId: messageId,
+    RPCPath: rpcPath,
+    ErrorCode: 0,
+    Message: responseBytes,
+  });
+  const responsePayload = responseWrapperType.encode(responseWrapper).finish();
+  const responseLengthHeader = Buffer.alloc(TCP_LENGTH_HEADER_SIZE);
+  responseLengthHeader.writeUint32BE(responsePayload.length);
+  return Buffer.concat([responseLengthHeader, responsePayload]);
+}
+
+function wrapJsonResponse(messageId, rpcPath, responseJson) {
+  const responseWrapperType = loadProtoType(
+    PROTO_JSON_RESPONSE_WRAPPER,
+    "ProjectBoundary.JSONResponseWrapper"
+  );
+  const responseWrapper = responseWrapperType.create({
+    MessageId: messageId,
+    RPCPath: rpcPath,
+    ErrorCode: 0,
+    JSONMessage: JSON.stringify(responseJson),
+  });
+  const responsePayload = responseWrapperType.encode(responseWrapper).finish();
+  const responseLengthHeader = Buffer.alloc(TCP_LENGTH_HEADER_SIZE);
+  responseLengthHeader.writeUint32BE(responsePayload.length);
+  return Buffer.concat([responseLengthHeader, responsePayload]);
+}
+
+function encodeProtoMessage(protoPath, typeName, payload) {
+  const type = loadProtoType(protoPath, typeName);
+  return type.encode(type.create(payload)).finish();
+}
+
+function sendProtoResponse(socket, messageId, rpcPath, protoPath, typeName, payload) {
+  const responseBytes = encodeProtoMessage(protoPath, typeName, payload);
+  socket.write(wrapResponse(messageId, rpcPath, responseBytes));
+  return responseBytes;
+}
+
+function sendEncodedProtoResponse(socket, messageId, rpcPath, responseBytes) {
+  socket.write(wrapResponse(messageId, rpcPath, responseBytes));
+}
+
+function sendJsonResponse(socket, messageId, rpcPath, responseJson) {
+  socket.write(wrapJsonResponse(messageId, rpcPath, responseJson));
+}
+
+/** Encode a response with a single StatusCode: 0 varint field */
+function encodeStatusCodeResponse(protoPath, messageName) {
+  return encodeProtoMessage(protoPath, messageName, { StatusCode: 0 });
+}
+
+function decodeRequestMessage(protoPath, typeName, messageBytes) {
+  const type = loadProtoType(protoPath, typeName);
+  return type.toObject(type.decode(messageBytes), objectOptions);
+}
+
+// -----------------------------------------------------------------------------
+//  Notification / region helpers
+// -----------------------------------------------------------------------------
+
+function buildNotification(title, content, background, languageCode, platform, timezone) {
+  return {
+    Id: crypto.randomUUID().toString(),
+    Title: title,
+    Content: content,
+    Background: background,
+    LanguageCode: languageCode,
+    Platform: platform,
+    Unknown1: 1,
+    Timezone: timezone,
+    Unknown2: 1,
+  };
+}
+
+function buildRegionList() {
+  return [
+    {
+      RegionId: matchmakingUDPServerDiscoveryPayload.servers[0].region_id,
+      RegionName: "us-east1",
+    },
+    {
+      RegionId: matchmakingUDPServerDiscoveryPayload.servers[1].region_id,
+      RegionName: "asia-east2",
+    },
+  ];
+}
+
+// =============================================================================
+//  Loadout Persistence — role-archive.json store + GetPlayerArchiveV2 encoding
+// =============================================================================
+
+// ---- protobuf helpers ----
+
+function encodeVarint(value) {
+  if (value < 0) value = 0;
+  const parts = [];
+  while (value > 0x7f) {
+    parts.push((value & 0x7f) | 0x80);
+    value >>>= 7;
+  }
+  parts.push(value & 0x7f);
+  return Buffer.from(parts);
+}
+
+function readVarint(buf, offset) {
+  let value = 0,
+    shift = 0;
+  while (offset < buf.length) {
+    const b = buf[offset++];
+    value |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+    if (shift > 70) break;
+  }
+  return { value, next: offset };
+}
+
+function readLengthDelimited(buf, offset) {
+  const { value: len, next } = readVarint(buf, offset);
+  if (next + len > buf.length) return { value: Buffer.alloc(0), next: buf.length };
+  return { value: buf.subarray(next, next + len), next: next + len };
+}
+
+function toBuffer(bytes) {
+  if (bytes == null) return Buffer.alloc(0);
+  if (Buffer.isBuffer(bytes)) return bytes;
+  if (bytes instanceof Uint8Array) return Buffer.from(bytes);
+  if (typeof bytes === "string") return Buffer.from(bytes, "binary");
+  try {
+    return Buffer.from(bytes);
+  } catch (_) {
+    return Buffer.alloc(0);
+  }
+}
+
+// ---- role-archive.json I/O ----
+
+function loadArchive() {
+  try {
+    if (!fs.existsSync(ARCHIVE_PATH)) {
+      roleArchive = {};
+      return;
+    }
+    const raw = JSON.parse(fs.readFileSync(ARCHIVE_PATH, "utf8"));
+    roleArchive = raw && raw.roles && typeof raw.roles === "object" ? raw.roles : {};
+    logger.info(`[PERSIST] Loaded ${Object.keys(roleArchive).length} roles`);
+  } catch (e) {
+    logger.error("[PERSIST] Load failed:", e.message);
+    roleArchive = {};
+  }
+}
+
+function saveArchive() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(
+      ARCHIVE_PATH,
+      JSON.stringify({ savedAt: new Date().toISOString(), roles: roleArchive }, null, 2),
+      "utf8"
+    );
+  } catch (e) {
+    logger.error("[PERSIST] Save failed:", e.message);
+  }
+}
+
+function ensureRoleEntry(roleId) {
+  if (!roleArchive[roleId] || typeof roleArchive[roleId] !== "object") {
+    roleArchive[roleId] = { RoleID: roleId };
+  }
+  roleArchive[roleId].RoleID = roleId;
+  return roleArchive[roleId];
+}
+
+// ---- SkinConfig encoding (field 8) ----
+// Codec sub_1409D62E0: field 1 (0x0a) = SuitConfig, field 2 (0x12) = arm badge, field 3 (0x1a) = head ornament.
+// SuitConfig sub-message: field 1 (0x0a) = skinItem (model), field 2 (0x12) = paintItem (color).
+
+function encodeSkinConfig(stored) {
+  if (!stored[SKIN_BASE_KEY] || stored[SKIN_BASE_KEY] === "None") return null;
+
+  const skinItem = stored[SKIN_BASE_KEY];
+  const paintItem =
+    stored[SKIN_PAINT_KEY] && stored[SKIN_PAINT_KEY] !== "None"
+      ? stored[SKIN_PAINT_KEY]
+      : null;
+
+  // SuitConfig: field 1 (0x0a) = skinItem (model), field 2 (0x12) = paintItem (color)
+  const suitParts = [];
+  const skinBytes = Buffer.from(skinItem, "utf8");
+  suitParts.push(Buffer.from([0x0a]), Buffer.from([skinBytes.length]), skinBytes);
+  if (paintItem) {
+    const paintBytes = Buffer.from(paintItem, "utf8");
+    suitParts.push(Buffer.from([0x12]), Buffer.from([paintBytes.length]), paintBytes);
+  }
+  const suitBody = Buffer.concat(suitParts);
+
+  // SkinConfig: field 1 (0x0a) = SuitConfig, field 2 (0x12) = arm badge, field 3 (0x1a) = head ornament
+  const skinParts = [];
+  skinParts.push(Buffer.from([0x0a]), encodeVarint(suitBody.length), suitBody);
+
+  // Field 2 (0x12): arm badge (slot 9)
+  const armBadge = stored[`${COSMETIC_KEY_PREFIX}9`];
+  if (armBadge && armBadge !== "None") {
+    const abBytes = Buffer.from(armBadge, "utf8");
+    skinParts.push(Buffer.from([0x12]), Buffer.from([abBytes.length]), abBytes);
+  }
+
+  // Field 3 (0x1a): head ornament (slot 10)
+  const headOrn = stored[`${COSMETIC_KEY_PREFIX}10`];
+  if (headOrn && headOrn !== "None") {
+    const ornBytes = Buffer.from(headOrn, "utf8");
+    skinParts.push(Buffer.from([0x1a]), Buffer.from([ornBytes.length]), ornBytes);
+  }
+
+  return Buffer.concat(skinParts);
+}
+
+// ---- WeaponConfig encoding (field 9) ----
+// Wire format: repeated 0x0a [varint] [sub_1409D2120 blob]
+// protobufjs adds the outer 0x4a field wrapper
+
+function encodeWeaponConfig(stored) {
+  if (!stored[WEAPON_CONFIG_KEY] || typeof stored[WEAPON_CONFIG_KEY] !== "object") return null;
+
+  const weaponIds = Object.keys(stored[WEAPON_CONFIG_KEY]).filter(
+    (k) =>
+      typeof stored[WEAPON_CONFIG_KEY][k] === "string" &&
+      stored[WEAPON_CONFIG_KEY][k].length > 0
+  );
+  if (weaponIds.length === 0) return null;
+
+  const parts = [];
+  for (const weaponId of weaponIds) {
+    const blob = Buffer.from(stored[WEAPON_CONFIG_KEY][weaponId], "base64");
+    parts.push(Buffer.from([0x0a]), encodeVarint(blob.length), blob);
+  }
+  return Buffer.concat(parts);
+}
+
+// ---- Build PlayerRoleData for GetPlayerArchiveV2 response ----
+
+function buildPlayerRoleData(roleId) {
+  // Case-insensitive lookup (game sends "Sniper", we may store "SNIPER")
+  const lookupId =
+    roleId in roleArchive
+      ? roleId
+      : Object.keys(roleArchive).find((k) => k.toLowerCase() === roleId.toLowerCase());
+  const stored = lookupId ? roleArchive[lookupId] : null;
+
+  const out = { RoleID: roleId };
+  if (!stored) return out;
+
+  for (const key of [
+    "LeftPylon",
+    "RightPylon",
+    "MobilityModule",
+    "MeleeWeapon",
+    "PrimaryWeapon",
+    "SecondWeapon",
+  ]) {
+    const v = stored[key];
+    if (typeof v === "string" && v.length > 0 && v !== "None") out[key] = v;
+  }
+
+  const skinConfig = encodeSkinConfig(stored);
+  if (skinConfig) out.SkinConfig = skinConfig;
+
+  const weaponConfig = encodeWeaponConfig(stored);
+  if (weaponConfig) out.WeaponConfig = weaponConfig;
+
+  // SkinPaint (field 10): paint/color variant string
+  if (stored[SKIN_PAINT_KEY] && typeof stored[SKIN_PAINT_KEY] === "string" && stored[SKIN_PAINT_KEY] !== "None")
+    out.SkinPaint = stored[SKIN_PAINT_KEY];
+
+  return out;
+}
+
+// ---- RPC request parsers ----
+
+function parseUpdateRoleArchiveRequest(messageBytes) {
+  const buf = toBuffer(messageBytes);
+  let i = 0;
+  let slot = null,
+    roleId = null,
+    itemId = null,
+    skinBase = null,
+    skinOrnament = null;
+
+  while (i < buf.length) {
+    const { value: tag, next } = readVarint(buf, i);
+    i = next;
+    const fieldNumber = tag >>> 3;
+    const wireType = tag & 0x7;
+
+    if (wireType === 0) {
+      const { value, next: n } = readVarint(buf, i);
+      i = n;
+      if (fieldNumber === 1) slot = value;
+    } else if (wireType === 2) {
+      const { value, next: n } = readLengthDelimited(buf, i);
+      i = n;
+      const text = value.toString("utf8");
+      if (fieldNumber === 2) roleId = text;
+      else if (fieldNumber === 3) itemId = text;
+      else if (fieldNumber === 4) {
+        // Nested skin info: field 1 = base, field 2 = ornament
+        let j = 0;
+        while (j < value.length) {
+          const { value: nTag, next: nj } = readVarint(value, j);
+          j = nj;
+          if ((nTag & 0x7) !== 2) break;
+          const { value: nBytes, next: nk } = readLengthDelimited(value, j);
+          j = nk;
+          const nText = nBytes.toString("utf8");
+          if (nTag >>> 3 === 1) skinBase = nText;
+          else if (nTag >>> 3 === 2) skinOrnament = nText;
+        }
+      }
+    } else if (wireType === 1) {
+      i += 8;
+    } else if (wireType === 5) {
+      i += 4;
+    } else {
+      break;
+    }
+  }
+
+  return { slot, roleId, itemId, skinBase, skinOrnament };
+}
+
+function parseUpdateWeaponArchiveRequest(messageBytes) {
+  const buf = toBuffer(messageBytes);
+  let i = 0;
+  let roleId = null,
+    weaponArchiveBlob = null;
+
+  while (i < buf.length) {
+    const { value: tag, next } = readVarint(buf, i);
+    i = next;
+    const fieldNumber = tag >>> 3;
+    const wireType = tag & 0x7;
+
+    if (wireType === 2) {
+      const { value, next: n } = readLengthDelimited(buf, i);
+      i = n;
+      if (fieldNumber === 1) roleId = value.toString("utf8");
+      else if (fieldNumber === 3) weaponArchiveBlob = value;
+    } else if (wireType === 0) {
+      i = readVarint(buf, i).next;
+    } else if (wireType === 1) {
+      i += 8;
+    } else if (wireType === 5) {
+      i += 4;
+    } else {
+      break;
+    }
+  }
+
+  return { roleId, weaponArchiveBlob };
+}
+
+function extractWeaponIdFromArchiveBlob(blob) {
+  if (!blob || blob.length === 0) return null;
+  const { value: tag, next } = readVarint(blob, 0);
+  if (tag >>> 3 === 1 && (tag & 0x7) === 2) {
+    const { value } = readLengthDelimited(blob, next);
+    return value.toString("utf8");
+  }
+  return null;
+}
+
+// ---- RPC request handlers (mutate roleArchive) ----
+
+function handleUpdateRoleArchive(messageBytes) {
+  const req = parseUpdateRoleArchiveRequest(messageBytes);
+  if (!req.roleId) return;
+
+  const entry = ensureRoleEntry(req.roleId);
+  const field = SLOT_TO_FIELD[req.slot];
+
+  if (field && req.itemId) {
+    entry[field] = req.itemId;
+    logger.info(`[PERSIST] ${req.roleId}.${field} = ${req.itemId}`);
+  } else if (req.slot === 7) {
+    if (req.skinBase) entry[SKIN_BASE_KEY] = req.skinBase;
+    if (req.skinOrnament) entry[SKIN_PAINT_KEY] = req.skinOrnament;
+    logger.info(`[PERSIST] ${req.roleId} skin = ${req.skinBase} / ${req.skinOrnament}`);
+  } else if ((req.slot === 9 || req.slot === 10) && req.itemId) {
+    entry[`${COSMETIC_KEY_PREFIX}${req.slot}`] = req.itemId;
+    logger.info(`[PERSIST] ${req.roleId} cosmetic #${req.slot} = ${req.itemId}`);
+  }
+
+  saveArchive();
+}
+
+function handleUpdateWeaponArchive(messageBytes) {
+  const req = parseUpdateWeaponArchiveRequest(messageBytes);
+  if (!req.roleId || !req.weaponArchiveBlob || req.weaponArchiveBlob.length === 0) return;
+
+  const weaponId = extractWeaponIdFromArchiveBlob(req.weaponArchiveBlob);
+  if (!weaponId) return;
+
+  const entry = ensureRoleEntry(req.roleId);
+  if (!entry[WEAPON_CONFIG_KEY]) entry[WEAPON_CONFIG_KEY] = {};
+  entry[WEAPON_CONFIG_KEY][weaponId] = req.weaponArchiveBlob.toString("base64");
+
+  logger.info(
+    `[PERSIST] ${req.roleId}.${weaponId} weapon archive (${req.weaponArchiveBlob.length}B)`
+  );
+  saveArchive();
+}
+
+// ---- Hex diagnostic logger (disabled in production) ----
+
+function logLoadoutHex({ rpcPath, messageId, messageBytes, frameBytes, extra }) {
+  if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+  const day = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+  const logPath = path.join(LOG_DIR, `loadout-hex-${day}.log`);
+  const msgBuf = toBuffer(messageBytes);
+  const lines = [
+    `=== ${new Date().toISOString()} ===`,
+    `RPCPath: ${rpcPath}`,
+    `MessageId: ${messageId}`,
+    `MessageBytesLen: ${msgBuf.length}`,
+    `MessageBytesHex: ${msgBuf.toString("hex")}`,
+  ];
+  if (frameBytes != null) {
+    const fb = toBuffer(frameBytes);
+    lines.push(`FrameBytesLen: ${fb.length}`, `FrameBytesHex: ${fb.toString("hex")}`);
+  }
+  if (extra) lines.push(`Extra: ${JSON.stringify(extra)}`);
+  lines.push("");
+  fs.appendFileSync(logPath, lines.join("\n"), "utf8");
+}
+
+// ---- Initialize persistence ----
+
+loadArchive();
+
+// =============================================================================
+//  HTTP (Express)
+// =============================================================================
+
 const app = express();
 
-// ---- Definition index and loadout storage ----
-const { getDefinitionIndex } = require('./game/definitionIndex');
-const { getLoadoutStore } = require('./game/loadoutStore');
-
-app.use(bodyParser.json({ limit: '2mb' }));
+app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
 app.use((req, res, next) => {
-    // Avoid logging full /api/ bodies because loadout JSON can be large.
-    if (req.originalUrl.startsWith('/api/')) {
-        console.log(`\n=== API REQUEST ===`);
-        console.log(`Time: ${new Date().toISOString()}`);
-        console.log(`Method: ${req.method}`);
-        console.log(`URL: ${req.originalUrl}`);
-        console.log('====================\n');
-    } else {
-        console.log('\n=== RECEIVED REQUEST ===');
-        console.log(`Time: ${new Date().toISOString()}`);
-        console.log(`Method: ${req.method}`);
-        console.log(`URL: ${req.originalUrl}`);
-        console.log(`Headers:`, JSON.stringify(req.headers, null, 2));
-        console.log(`Body:`, JSON.stringify(req.body, null, 2));
-        console.log('========================\n');
-    }
-    next();
+  logger.info("\n=== RECEIVED REQUEST ===");
+  logger.info(`Time: ${new Date().toISOString()}`);
+  logger.info(`Method: ${req.method}`);
+  logger.info(`URL: ${req.originalUrl}`);
+  logger.info(`Headers:`, JSON.stringify(req.headers, null, 2));
+  logger.info(`Body:`, JSON.stringify(req.body, null, 2));
+  logger.info("========================\n");
+  next();
 });
-
-const MatchmakingHost = "204.12.195.98";
-const MatchmakingPort = 9000;
-
-// MatchServer management API base URL (HTTP API on port 9001)
-const MATCHSERVER_API = `http://${MatchmakingHost}:9001`;
-
-const matchmakingUDPServerDiscoveryPayload = {"servers":[{"location_id":6,"region_id":"336d1f3e-3ecb-11eb-a7dc-3b7705f20f56","ipv4":MatchmakingHost,"ipv6":"","port":MatchmakingPort}]}
 
 app.get("/", (req, res) => {
   res.status(200).json(matchmakingUDPServerDiscoveryPayload);
 });
 
 app.post("/recordClientStatus", (req, res) => {
-    res.status(200).json({}); 
+  res.status(200).json({});
 });
 
-const TEMP_USER_ID = "76561198211631084";
-const LEGACY_GATE_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.KMUFsIDTnFmyG3nMiGM6H9FNFUROf3wh7SmqJp-QV30";
-const gateSessions = new Map([[LEGACY_GATE_TOKEN, TEMP_USER_ID]]);
+// Working connect endpoint (duplicate "//connectServer" removed — same handler)
+app.post("/connectServer", (req, res) => {
+  const loginToken = req.body.loginToken;
+  const platform = req.body.platform;
+  const playerId = req.body.playerId;
+  const version = req.body.version;
 
-function normalizePlayerId(playerId) {
-    if (typeof playerId !== "string") return TEMP_USER_ID;
-    const trimmed = playerId.trim();
-    return trimmed || TEMP_USER_ID;
-}
+  logger.info("Connection Request:", {
+    platform,
+    playerId,
+    version,
+  });
 
-function issueGateToken(playerId) {
-    const normalizedPlayerId = normalizePlayerId(playerId);
-    const gateToken = `prb.${Buffer.from(normalizedPlayerId, "utf8").toString("base64url")}.${crypto.randomUUID()}`;
-    gateSessions.set(gateToken, normalizedPlayerId);
-    return { gateToken, playerId: normalizedPlayerId };
-}
-
-function handleConnectServer(req, res) {
-    const loginToken = req.body.loginToken;
-    const platform = req.body.platform;
-    const version = req.body.version;
-    const { gateToken, playerId } = issueGateToken(req.body.playerId);
-
-    console.log("Connection Request:", {
-        platform,
-        playerId,
-        version,
-        loginTokenPresent: Boolean(loginToken),
-    });
-
-    res.status(200).json({
-        "error": 0,
-        "userId": playerId,
-        "aceId": "test",
-        "gateToken": gateToken,
-        "endpoint": "127.0.0.1:6969",
-    });
-}
-
-app.post("//connectServer", handleConnectServer);
-app.post("/connectServer", handleConnectServer);
-
-// =====================================================================
-//  REST API for loadouts and definitions, used by Payload / Browser.
-// =====================================================================
-
-// ---- Definition queries ----
-
-// GET /api/definitions/roles - all role IDs
-app.get("/api/definitions/roles", (req, res) => {
-    const index = getDefinitionIndex();
-    res.status(200).json({ roles: index.getAllRoleIds() });
+  res.status(200).json({
+    error: 0,
+    userId: playerId,
+    aceId: "test",
+    gateToken: TEST_GATE_TOKEN,
+    endpoint: RPC_ENDPOINT,
+  });
 });
 
-// GET /api/definitions/roles/:roleId - role definition
-app.get("/api/definitions/roles/:roleId", (req, res) => {
-    const index = getDefinitionIndex();
-    const role = index.getRole(req.params.roleId);
-    if (!role) {
-        return res.status(404).json({ error: "Role not found", roleId: req.params.roleId });
-    }
-    res.status(200).json({
-        roleId: req.params.roleId,
-        weaponScope: Array.from(role.weaponScope),
-        podScope: Array.from(role.podScope),
-        meleeWeaponScope: Array.from(role.meleeWeaponScope),
-        mobilityScope: Array.from(role.mobilityScope),
-        radarId: role.radarId,
-        vehicleId: role.vehicleId,
-        spaceSuitSkinScope: Array.from(role.spaceSuitSkinScope),
-        armBadgeScope: Array.from(role.armBadgeScope),
-        headAccessoryScope: Array.from(role.headAccessoryScope),
-    });
-});
+// ---- HTTP API for DLL LoadoutFix client ----
 
-// GET /api/definitions/weapons - all weapon IDs
-app.get("/api/definitions/weapons", (req, res) => {
-    const index = getDefinitionIndex();
-    res.status(200).json({ weapons: index.getAllWeaponIds() });
-});
-
-// GET /api/definitions/weapons/:weaponId - weapon definition
-app.get("/api/definitions/weapons/:weaponId", (req, res) => {
-    const index = getDefinitionIndex();
-    const weapon = index.getWeapon(req.params.weaponId);
-    if (!weapon) {
-        return res.status(404).json({ error: "Weapon not found", weaponId: req.params.weaponId });
-    }
-    // Convert Set values to arrays for JSON serialization.
-    const slotScopes = {};
-    for (const [slotName, partSet] of Object.entries(weapon.slotScopes)) {
-        slotScopes[slotName] = Array.from(partSet);
-    }
-    res.status(200).json({
-        weaponId: req.params.weaponId,
-        slotScopes,
-        receiverMain: weapon.receiverMain,
-    });
-});
-
-// GET /api/definitions/resolve-weapon/:roleId/:baseWeaponId - weapon redirect
-app.get("/api/definitions/resolve-weapon/:roleId/:baseWeaponId", (req, res) => {
-    const index = getDefinitionIndex();
-    const result = index.resolveRoleWeaponId(req.params.roleId, req.params.baseWeaponId);
-    res.status(200).json({
-        roleId: req.params.roleId,
-        baseWeaponId: req.params.baseWeaponId,
-        roleWeaponId: result,
-        found: result !== null,
-    });
-});
-
-// GET /api/definitions/items/:itemId/type - item type
-app.get("/api/definitions/items/:itemId/type", (req, res) => {
-    const index = getDefinitionIndex();
-    const itemType = index.getItemType(req.params.itemId);
-    res.status(200).json({
-        itemId: req.params.itemId,
-        type: itemType || "Unknown",
-        found: itemType !== null,
-    });
-});
-
-// ---- Loadout queries / updates ----
-
-// GET /api/loadout/:playerId - full player loadout
 app.get("/api/loadout/:playerId", (req, res) => {
-    const store = getLoadoutStore();
-    const data = store.getFullLoadout(req.params.playerId);
-    if (!data) {
-        return res.status(404).json({ error: "Player loadout not found", playerId: req.params.playerId });
-    }
-    res.status(200).json(data);
-});
-
-// PUT /api/loadout/:playerId - update a player's full loadout.
-app.put("/api/loadout/:playerId", (req, res) => {
-    const store = getLoadoutStore();
-    const index = getDefinitionIndex();
-
-    if (!req.body || !req.body.roles || typeof req.body.roles !== "object") {
-        return res.status(400).json({ error: "Request body must contain a roles object or array" });
-    }
-
-    const normalizedLoadout = store.normalizeFullLoadout(req.body);
-    const validationLoadout = {
-        ...normalizedLoadout,
-        roles: Object.values(normalizedLoadout.roles || {}),
+  const roles = {};
+  for (const [roleId, stored] of Object.entries(roleArchive)) {
+    if (!stored || typeof stored !== "object") continue;
+    roles[roleId] = {
+      primaryWeapon: stored.PrimaryWeapon || null,
+      secondaryWeapon: stored.SecondWeapon || null,
+      leftPylon: stored.LeftPylon || null,
+      rightPylon: stored.RightPylon || null,
+      meleeWeapon: stored.MeleeWeapon || null,
+      mobilityModule: stored.MobilityModule || null,
+      skinBase: stored[SKIN_BASE_KEY] || null,
+      skinPaint: stored[SKIN_PAINT_KEY] || null,
+      cosmetic9: stored[`${COSMETIC_KEY_PREFIX}9`] || null,
+      cosmetic10: stored[`${COSMETIC_KEY_PREFIX}10`] || null,
+      weaponConfigs: stored[WEAPON_CONFIG_KEY] || {},
     };
-    const validation = index.validateLoadout(validationLoadout);
-    store.setFullLoadout(req.params.playerId, normalizedLoadout);
-
-    res.status(200).json({
-        playerId: req.params.playerId,
-        updatedAt: new Date().toISOString(),
-        validation,
-    });
+  }
+  res.status(200).json({ playerId: req.params.playerId, roles });
 });
 
-// GET /api/loadout/:playerId/:roleId - single role loadout snapshot
-app.get("/api/loadout/:playerId/:roleId", (req, res) => {
-    const store = getLoadoutStore();
-    const snapshot = store.getRoleLoadoutSnapshot(req.params.playerId, req.params.roleId);
-    if (!snapshot) {
-        return res.status(404).json({
-            error: "Loadout snapshot not found",
-            playerId: req.params.playerId,
-            roleId: req.params.roleId,
-        });
+// =============================================================================
+//  RPC Handlers
+// =============================================================================
+
+function handleGateTokenEcho(ctx) {
+  // Client echoes gateToken as RPCPath during handshake — reflect the raw frame
+  ctx.socket.write(ctx.frameBytes);
+}
+
+function handleUpdateRoleArchiveV2(ctx) {
+  handleUpdateRoleArchive(ctx.messageBytes);
+  logLoadoutHex({
+    rpcPath: ctx.rpcPath,
+    messageId: ctx.messageId,
+    messageBytes: ctx.messageBytes,
+    frameBytes: ctx.frameBytes,
+  });
+  const resp = encodeStatusCodeResponse(
+    "./game/proto/Response/UpdateRoleArchiveV2.proto",
+    "ProjectBoundary.UpdateRoleArchiveV2Response"
+  );
+  sendEncodedProtoResponse(ctx.socket, ctx.messageId, ctx.rpcPath, resp);
+}
+
+function handleUpdateWeaponArchiveV2(ctx) {
+  handleUpdateWeaponArchive(ctx.messageBytes);
+  logLoadoutHex({
+    rpcPath: ctx.rpcPath,
+    messageId: ctx.messageId,
+    messageBytes: ctx.messageBytes,
+    frameBytes: ctx.frameBytes,
+  });
+  // Same status-code proto as UpdateRoleArchiveV2 (intentional / matches original)
+  const resp = encodeStatusCodeResponse(
+    "./game/proto/Response/UpdateRoleArchiveV2.proto",
+    "ProjectBoundary.UpdateRoleArchiveV2Response"
+  );
+  sendEncodedProtoResponse(ctx.socket, ctx.messageId, ctx.rpcPath, resp);
+}
+
+function handleGetPlayerArchiveV2(ctx) {
+  logger.info("[RECV] Player Archive V2!");
+
+  const reqObj = decodeRequestMessage(
+    "./game/proto/Request/GetPlayerArchiveV2Request.proto",
+    "ProjectBoundary.GetPlayerArchiveV2Request",
+    ctx.messageBytes
+  );
+  const roleIds = reqObj.RoleIDs || [];
+
+  logLoadoutHex({
+    rpcPath: ctx.rpcPath,
+    messageId: ctx.messageId,
+    messageBytes: ctx.messageBytes,
+    frameBytes: ctx.frameBytes,
+    extra: { RoleIDs: roleIds },
+  });
+
+  // Codec sub_1409D3CE0: field 1 (0x0a) = repeated RoleArchiveDataV2, field 2 (0x10) = varint.
+  // Field 2 omitted when PlayerLevel=0 (proto3 default).
+  const responseObj = { PlayerRoleDatas: [], PlayerLevel: 0 };
+  for (const roleId of roleIds) {
+    responseObj.PlayerRoleDatas.push(buildPlayerRoleData(roleId));
+  }
+
+  const responseBytes = encodeProtoMessage(
+    "./game/proto/Response/GetPlayerArchiveV2Response.proto",
+    "ProjectBoundary.GetPlayerArchiveV2Response",
+    responseObj
+  );
+
+  const responseFrame = wrapResponse(ctx.messageId, ctx.rpcPath, responseBytes);
+  logLoadoutHex({
+    rpcPath: ctx.rpcPath + " (response)",
+    messageId: ctx.messageId,
+    messageBytes: responseBytes,
+    frameBytes: responseFrame,
+    extra: { RoleIDs: roleIds, source: "role-archive.json" },
+  });
+  ctx.socket.write(responseFrame);
+}
+
+function handleQueryAssets(ctx) {
+  logger.info("[RECV] Query Assets!");
+  const responseObj = { ItemDatas: [], ItemCount: 0 };
+  try {
+    const allItems = Object.keys(
+      JSON.parse(fs.readFileSync("./game/definitions/DT_ItemType.json", "utf8"))[0]["Rows"]
+    );
+    for (const item of allItems) {
+      responseObj.ItemDatas.push({ ItemId: item, Unknown1: 1, Unknown2: 1, Unknown3: 1 });
     }
-    res.status(200).json(snapshot);
-});
-
-// ---- Loadout validation / filtering ----
-
-// POST /api/loadout/validate - validate loadout JSON
-app.post("/api/loadout/validate", (req, res) => {
-    const index = getDefinitionIndex();
-    const loadout = req.body && req.body.loadout ? req.body.loadout : req.body;
-    const result = index.validateLoadout(loadout);
-    res.status(200).json(result);
-});
-
-// POST /api/loadout/filter - remove incompatible loadout items
-app.post("/api/loadout/filter", (req, res) => {
-    const index = getDefinitionIndex();
-    const loadout = req.body && req.body.loadout ? req.body.loadout : req.body;
-    const filtered = index.filterLoadout(loadout);
-    const removedCount = (filtered._filtered && filtered._filtered.removedItemCount) || 0;
-    res.status(200).json({
-        loadout: filtered,
-        removedItemCount: removedCount,
-    });
-});
-
-// ---- Health check ----
-app.get("/api/health", (req, res) => {
-    const index = getDefinitionIndex();
-    const store = getLoadoutStore();
-    res.status(200).json({
-        status: "ok",
-        definitions: {
-            roles: index.roles.size,
-            weapons: index.weapons.size,
-            parts: index.parts.size,
-            itemTypes: index.itemTypes.size,
-        },
-    });
-});
-
-const net = require('net');
-
-const protobuf = require("protobufjs");
-
-const crypto = require("crypto");
-
-function WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes){
-  let Root = protobuf.loadSync("./game/proto/Response/ResponseWrapper.proto");
-
-  let ResponseWrapperType = Root.lookupType("ProjectBoundary.ResponseWrapper");
-
-  let ResponseWrapper = ResponseWrapperType.create({MessageId: MessageId, RPCPath: RPCPath, ErrorCode: 0, Message: ResponseBytes});
-  let ResponsePayload = ResponseWrapperType.encode(ResponseWrapper).finish();
-  let ResponseLengthHeader = Buffer.alloc(4);
-  ResponseLengthHeader.writeUint32BE(ResponsePayload.length);
-
-  return Buffer.concat([ResponseLengthHeader, ResponsePayload]);
+    responseObj.ItemCount = responseObj.ItemDatas.length;
+  } catch (e) {
+    logger.error("[QueryAssets] Failed:", e.message);
+  }
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/QueryAssetsResponse.proto",
+    "ProjectBoundary.QueryAssetsResponse",
+    responseObj
+  );
 }
 
-function WrapJSONMessageAndSerialize(MessageId, RPCPath, ResponseJSON){
-  let Root = protobuf.loadSync("./game/proto/Response/JSONResponseWrapper.proto");
+function handleQueryNotification(ctx) {
+  const reqObj = decodeRequestMessage(
+    "./game/proto/Request/QueryNotificationRequest.proto",
+    "ProjectBoundary.QueryNotificationRequest",
+    ctx.messageBytes
+  );
+  const platform = reqObj.Platform;
+  const languageCode = reqObj.LanguageCode;
 
-  let ResponseWrapperType = Root.lookupType("ProjectBoundary.JSONResponseWrapper");
-
-  let ResponseWrapper = ResponseWrapperType.create({MessageId: MessageId, RPCPath: RPCPath, ErrorCode: 0, JSONMessage: JSON.stringify(ResponseJSON)});
-  let ResponsePayload = ResponseWrapperType.encode(ResponseWrapper).finish();
-  let ResponseLengthHeader = Buffer.alloc(4);
-  ResponseLengthHeader.writeUint32BE(ResponsePayload.length);
-
-  return Buffer.concat([ResponseLengthHeader, ResponsePayload]);
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/QueryNotificationResponse.proto",
+    "ProjectBoundary.QueryNotificationResponse",
+    {
+      Unknown: 0,
+      Notifications: [
+        buildNotification(
+          "4/01/2026 Patchnotes",
+          PATCHNOTES_4012026_TEXT,
+          "",
+          languageCode,
+          platform,
+          "America/New_York"
+        ),
+        buildNotification(
+          "3/31/2026 Patchnotes",
+          PATCHNOTES_3312026_TEXT,
+          "",
+          languageCode,
+          platform,
+          "America/New_York"
+        ),
+        buildNotification(
+          "Project Rebound Alpha",
+          ALPHA_TEXT,
+          "",
+          languageCode,
+          platform,
+          "America/New_York"
+        ),
+      ],
+    }
+  );
 }
 
-const ObjectOptions = {
-  Enums: String,  // enums as string names
-  longs: String,  // longs as strings (requires long.js)
-  defaults: true, // includes default values
-  arrays: true,   // populates empty arrays (repeated fields) even if defaults=false
-  objects: true,  // populates empty objects (map fields) even if defaults=false
-  oneofs: true    // includes virtual oneof fields set to the present field's name);
+function handleCreateParty(ctx) {
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/CreatePartyResponse.proto",
+    "ProjectBoundary.CreatePartyResponse",
+    { StatusCode: 0, PartyId: crypto.randomUUID().toString(), PartyMembers: [TEMP_USER_ID] }
+  );
+}
+
+function handlePartyReady(ctx) {
+  const reqObj = decodeRequestMessage(
+    "./game/proto/Request/PartyReadyRequest.proto",
+    "ProjectBoundary.PartyReadyRequest",
+    ctx.messageBytes
+  );
+  const partyId = reqObj.PartyId; // parsed for parity with original (unused)
+  void partyId;
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/PartyReadyResponse.proto",
+    "ProjectBoundary.PartyReadyResponse",
+    { StatusCode: 0 }
+  );
+}
+
+function handlePartyGet(_ctx) {
+  // no-op
+}
+
+function handleTextFilter(_ctx) {
+  // no-op
+}
+
+function handleSetPresence(ctx) {
+  const reqObj = decodeRequestMessage(
+    "./game/proto/Request/SetPartyPresenceRequest.proto",
+    "ProjectBoundary.SetPartyPresenceRequest",
+    ctx.messageBytes
+  );
+  partyPresence = reqObj.Presence;
+  logger.info(`[PARTY] Presence => ${partyPresence}`);
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/SetPartyPresenceResponse.proto",
+    "ProjectBoundary.SetPartyPresenceResponse",
+    { StatusCode: 0 }
+  );
+}
+
+function handleQueryPresence(ctx) {
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/QueryPartyPresenceResponse.proto",
+    "ProjectBoundary.QueryPartyPresenceResponse",
+    {
+      StatusCode: 0,
+      PartyMembers: [{ UserId: TEMP_USER_ID, Status: partyPresence }],
+    }
+  );
+}
+
+function handleQueryUnityMatchmakingRegion(ctx) {
+  logger.info("[RECV] Query Matchmaking Region!");
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/QueryMatchmakingRegionResponse.proto",
+    "ProjectBoundary.QueryMatchmakingRegionResponse",
+    { StatusCode: 0, Regions: buildRegionList() }
+  );
+}
+
+function handleStartUnityMatchmaking(ctx) {
+  logger.info("[RECV] Start Matchmaking!");
+  const reqObj = decodeRequestMessage(
+    "./game/proto/Request/StartMatchmakingRequest.proto",
+    "ProjectBoundary.StartMatchmakingRequest",
+    ctx.messageBytes
+  );
+  const userIdToMatchmake = reqObj.Payload.MatchmakingRequestorUserId; // parsed for parity
+  void userIdToMatchmake;
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/StartMatchmakingResponse.proto",
+    "ProjectBoundary.StartMatchmakingResponse",
+    { StatusCode: 0 }
+  );
+}
+
+function handleGetDataStatisticsInfo(ctx) {
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/GetDataStatisticsInfoResponse.proto",
+    "ProjectBoundary.GetDataStatisticsInfoResponse",
+    { StatusCode: 0, Datapoints: [] }
+  );
+}
+
+function handleQueryPlayList(ctx) {
+  logger.info("[RECV] Query Playlists!");
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/QueryPlaylistResponse.proto",
+    "ProjectBoundary.QueryPlaylistResponse",
+    { StatusCode: 0, PlaylistsJSON: JSON.stringify(PLAYLISTS_JSON) }
+  );
+}
+
+function handleQueryCurrency(ctx) {
+  sendProtoResponse(
+    ctx.socket,
+    ctx.messageId,
+    ctx.rpcPath,
+    "./game/proto/Response/QueryCurrencyResponse.proto",
+    "ProjectBoundary.QueryCurrencyResponse",
+    { CurrencyA: 0, CurrencyB: 0, CurrencyC: 0, CurrencyD: 0, CurrencyE: 0 }
+  );
+}
+
+const rpcHandlers = {
+  [TEST_GATE_TOKEN]: handleGateTokenEcho,
+  "/assets.Assets/UpdateRoleArchiveV2": handleUpdateRoleArchiveV2,
+  "/assets.Assets/UpdateWeaponArchiveV2": handleUpdateWeaponArchiveV2,
+  "/assets.Assets/GetPlayerArchiveV2": handleGetPlayerArchiveV2,
+  "/assets.Assets/QueryAssets": handleQueryAssets,
+  "/notification.Notification/QueryNotification": handleQueryNotification,
+  "/party.party/Create": handleCreateParty,
+  "/party.party/Ready": handlePartyReady,
+  "/party.party/Get": handlePartyGet,
+  "/chat.chat/TextFilter": handleTextFilter,
+  "/party.party/SetPresence": handleSetPresence,
+  "/party.party/QueryPresence": handleQueryPresence,
+  "/matchmaking.Matchmaking/QueryUnityMatchmakingRegion": handleQueryUnityMatchmakingRegion,
+  "/matchmaking.Matchmaking/StartUnityMatchmaking": handleStartUnityMatchmaking,
+  "/playerdata.PlayerDataClient/GetDataStatisticsInfo": handleGetDataStatisticsInfo,
+  "/matchmaking.Matchmaking/QueryPlayList": handleQueryPlayList,
+  "/profile.Profile/QueryCurrency": handleQueryCurrency,
 };
 
-function BuildNotification(Title, Content, Background, LanguageCode, Platform, Timezone){
-  return {
-    Id: crypto.randomUUID().toString(),
-    Title: Title,
-    Content: Content,
-    Background: Background,
-    LanguageCode: LanguageCode,
-    Platform: Platform,
-    Unknown1: 1,
-    Timezone: Timezone,
-    Unknown2: 1
-  }
-}
-
-const PATCHNOTES_4012026_TEXT = "Welcome to the second round of patchnotes! Most of this is bugfix-focused, and those fixes might not even work yet! Fun!\n\nNew Features:\n- PvE Match Support! This should (theoretically) allow you to take on Hard bots, either solo or CoOp! This still has to be hosted, but we might run some at some point!\n- Randomized map selection, from all available Boundary maps!\n- Proper TDM mode setup, first to 75 kills wins, should last 10 min!\n\nBugfixes:\n- HOPEFULLY fixed the 999/999 spawn bug, though we're gonna have to confirm this in a second to see if I actually fixed it or not!\n- Fixed up the logic server a little bit to make it somewhat more reliable, shouldn't crash as often now\n\nThat's it for today, hope y'all enjoy!"
-
-const PATCHNOTES_3312026_TEXT = "Welcome to the first round of patches for Project Rebound!\nNew Features:\n- Basic emulation of the Logic Server. This allows you to see the news (hi), adjust settings, and not have to reboot the game for every match\n- In-Game Medals & Scoring! Go for those headshots :)\nBugfixes:\n- Fixed several bugs causing respawning early to softlock the game. There is still one more bug I'm working out here, but there should already be improvement here.\n- Upgraded to 128 tick servers! This might get reverted if horrific things happen, but for now enjoy 128tick Boundary!\n- Various optimizations to backend tech, should make your matches significantly more stable!"
-
-const ALPHA_TEXT = "Welcome to the Project Rebound Alpha. Please be patient and respectful to me & your fellow playtesters. Matchmaking will prioritize short queues over full matches, so feel free to coordinate in the discord to get games going."
-
-const PLAYLISTS_JSON = { "PVP": [{ "Name": "Playtest", "Title": [{ "en": "Playtest" }], "Description": [, { "en": "Playtest a very early version of Project Rebound" }], "SecondaryDescription": [{ "en": "Please report any bugs to @systemdev in the Boundary discord" }], "BigTitle": [{ "en": "Playtest" }], "BigDescription": [{ "en": "Playtest a very early version of Project Rebound" }], "PlotImage": [{ "zh": "Capture" }, { "en": "Capture" }], "LargePlotImage": [{ "zh": "Capture" }, { "en": "Capture" }], "GameModeList": ["Purge"], "bHasFilter": false, "bIsLive": true, "Priority": 1, "StartTime": 0, "StopTime": 0 }] };
-
-let PartyPresence = "InMatching";
-
-function BuildRegionList(){
-  //[{RegionId: "336d1f3e-3ecb-11eb-a7dc-3b7705f20f56", RegionName: "us-east1"}]
-
-  let RegionList = [];
-
-  for(let Region in matchmakingUDPServerDiscoveryPayload.servers){
-    RegionList.push({RegionId: Region.regionid, RegionName: "us-east1"});
-  }
-
-  return RegionList;
-}
-
-// ---- MatchServer HTTP Client ----
-
-const http = require('http');
-
-function matchServerRequest(method, path, body) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(path, MATCHSERVER_API);
-    const bodyStr = body ? JSON.stringify(body) : '';
-    const options = {
-      hostname: url.hostname,
-      port: url.port,
-      path: url.pathname,
-      method,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) },
-      timeout: 5000,
-    };
-    const req = http.request(options, (res) => {
-      let data = '';
-      res.on('data', chunk => data += chunk);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch(_) { resolve({ _raw: data }); }
-      });
+function dispatchRpc(ctx) {
+  const handler = rpcHandlers[ctx.rpcPath];
+  if (!handler) {
+    logger.info("[RECV] Undefined Message:", { path: ctx.rpcPath, MessageId: ctx.messageId });
+    logLoadoutHex({
+      rpcPath: ctx.rpcPath,
+      messageId: ctx.messageId,
+      messageBytes: ctx.messageBytes,
+      frameBytes: ctx.frameBytes,
+      extra: { UNHANDLED: true },
     });
-    req.on('error', (e) => reject(e));
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    if (bodyStr) req.write(bodyStr);
-    req.end();
+    return;
+  }
+
+  try {
+    handler(ctx);
+  } catch (err) {
+    logger.error(
+      `[RPC] Handler failed path=${ctx.rpcPath} MessageId=${ctx.messageId}:`,
+      err && err.stack ? err.stack : err
+    );
+  }
+}
+
+// =============================================================================
+//  TCP RPC Server (port RPC_PORT)
+// =============================================================================
+
+function processTcpFrame(socket, frameBytes) {
+  // Early connection echo: length=2, payload="//"
+  if (frameBytes.length === 6 && frameBytes.toString("hex") === TCP_HANDSHAKE_ECHO_HEX) {
+    socket.write(frameBytes);
+    return;
+  }
+
+  const requestWrapperType = loadProtoType(
+    PROTO_REQUEST_WRAPPER,
+    "ProjectBoundary.RequestWrapper"
+  );
+
+  let requestWrapper;
+  try {
+    requestWrapper = requestWrapperType.decode(frameBytes.subarray(TCP_LENGTH_HEADER_SIZE));
+  } catch (_) {
+    return;
+  }
+
+  if (requestWrapper == undefined) return;
+
+  const requestObj = requestWrapperType.toObject(requestWrapper, objectOptions);
+  const messageId = requestObj.MessageId;
+  const rpcPath = requestObj.RPCPath;
+  const messageBytes = requestObj.Message;
+
+  dispatchRpc({
+    socket,
+    messageId,
+    rpcPath,
+    messageBytes,
+    frameBytes,
   });
 }
 
-// In-memory matchmaking ticket store (persists across connections)
-const matchTickets = new Map(); // ticketId -> { userId, gameMode, regionIds, status, serverIp, serverPort, createdAt }
+/**
+ * Proper length-prefixed receive buffer:
+ *   chunk → append → while complete frame → parse → leave remainder
+ * Handles fragmentation, coalescing, empty payloads, and bad length headers.
+ */
+function onTcpData(socket, chunk) {
+  socket._recvBuffer = Buffer.concat([socket._recvBuffer, chunk]);
 
-function generateTicketId() {
-  return crypto.randomUUID().toString();
-}
-
-// ---- MatchServer Integration ----
-
-let fs = require("fs");
-
-const server = net.createServer((socket) => {
-  console.log('\n=== Client connected ===');
-  console.log(`From: ${socket.remoteAddress}:${socket.remotePort}\n`);
-
-  socket.on('data', async (rawdata) => {
-    if(rawdata.length == 6 && rawdata.toString("hex") === "000000022f2f"){
-      //console.log("[RECV] Keepalive");
-
-      socket.write(rawdata);
+  while (true) {
+    if (socket._recvBuffer.length < TCP_LENGTH_HEADER_SIZE) {
       return;
     }
 
-    while(rawdata.length > 0){
-      let Length = rawdata.readUint32BE(0);
-
-      let data = rawdata.subarray(0, Length + 4);
-
-      rawdata = rawdata.subarray(4 + Length);
-
-      let Root = protobuf.loadSync("./game/proto/Request/RequestWrapper.proto");
-
-      let RequestWrapperType = Root.lookupType("ProjectBoundary.RequestWrapper");
-
-      let RequestWrapper;
-      
-      try{
-        RequestWrapper = RequestWrapperType.decode(data.subarray(4));
-      }
-      catch(e){
-
-      }
-      
-      if(RequestWrapper != undefined){
-      let RequestObj = RequestWrapperType.toObject(RequestWrapper, ObjectOptions);
-
-      const MessageId = RequestObj.MessageId;
-      const RPCPath = RequestObj.RPCPath;
-      const MessageBytes = RequestObj.Message;
-
-      if(gateSessions.has(RPCPath)){
-        socket.playerId = gateSessions.get(RPCPath);
-        console.log(`[SESSION] Bound protobuf socket to player ${socket.playerId}`);
-        socket.write(data);
-      }
-      else if(RPCPath === "/assets.Assets/UpdateRoleArchiveV2"){
-        console.log("[RECV] Update Role Archive V2!");
-
-        // Decode UpdateRoleArchiveV2Request: field1=Operation, field2=RoleId, field3=ItemId, field4=SkinData
-        let op = 1, roleId = '', itemId = '', skinData = null;
-        if (MessageBytes && MessageBytes.length > 0) {
-          try {
-            Root = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto");
-            let ReqType = Root.lookupType("ProjectBoundary.UpdateRoleArchiveV2Request");
-            let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
-            op = req.Operation ?? 1;
-            roleId = req.RoleId || '';
-            itemId = req.ItemId || '';
-            skinData = req.SkinData || null;
-          } catch(e) {
-            console.log("[ARCHIVE] Failed to decode UpdateRoleArchiveV2:", e.message);
-          }
-        }
-        if (skinData && skinData.length > 0) {
-          try {
-            // skinData is a Buffer from protobufjs decode
-            const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
-              .lookupType("ProjectBoundary.SkinPayload");
-            const skinObj = SkinType.toObject(SkinType.decode(skinData), ObjectOptions);
-            console.log(`[ARCHIVE] Update: op=${op} role=${roleId} item=${itemId} skinToken=${skinObj.TokenId || ''} ornament=${skinObj.OrnamentId || ''}`);
-          } catch(_) {
-            console.log(`[ARCHIVE] Update: op=${op} role=${roleId} item=${itemId} skinData=${skinData.length}b (raw)`);
-          }
-        } else {
-          console.log(`[ARCHIVE] Update: op=${op} role=${roleId} item=${itemId}`);
-        }
-
-        if (roleId) {
-          const store = getLoadoutStore();
-          const index = getDefinitionIndex();
-          const playerId = socket.playerId || TEMP_USER_ID;
-          const data = store.load(playerId) || { playerId, roles: {} };
-          if (!data.roles[roleId]) data.roles[roleId] = {};
-          const role = data.roles[roleId];
-
-          // Operation is not a pure slot index in captured traffic. Route by item
-          // type first, then use observed ops only to choose between sibling slots.
-          const SLOT_MAP = {
-            2: 'leftPylon', 3: 'rightPylon', 4: 'mobilityModule',
-            5: 'meleeWeapon', 6: 'primaryWeapon', 7: 'secondaryWeapon',
-          };
-          const setPrimaryWeapon = (nextWeapon) => {
-            role.primaryWeapon = nextWeapon;
-          };
-          const setSecondaryWeapon = (nextWeapon) => {
-            role.secondaryWeapon = nextWeapon;
-          };
-          const ensureWeaponArchive = (weaponId) => {
-            if (!weaponId || weaponId === 'None') return;
-            if (!role._weaponArchives || typeof role._weaponArchives !== 'object' || Array.isArray(role._weaponArchives)) {
-              role._weaponArchives = {};
-            }
-            if (!role._weaponArchives[weaponId]) {
-              const defaultRaw = store.buildDefaultWeaponArchiveRaw(roleId, weaponId);
-              if (defaultRaw) role._weaponArchives[weaponId] = defaultRaw;
-            }
-          };
-
-          if (itemId) {
-            const itemType = index.getItemType(itemId);
-            const roleDef = index.getRole(roleId) || index.getRole(String(roleId).toUpperCase());
-            const allowed = (scope) => !roleDef || (roleDef[scope] && roleDef[scope].has(itemId));
-
-            if (itemType === 'EPBItemType::Weapon' && allowed('weaponScope')) {
-              if (op === 2 || op === 7) setSecondaryWeapon(itemId);
-              else setPrimaryWeapon(itemId);
-              ensureWeaponArchive(itemId);
-            } else if (itemType === 'EPBItemType::Pod' && allowed('podScope')) {
-              if (op === 6 || op === 3 || op === 7) role.rightPylon = itemId;
-              else if (op === 5 || op === 2 || op === 1) role.leftPylon = itemId;
-              else if (!role.leftPylon || role.leftPylon === 'None') role.leftPylon = itemId;
-              else role.rightPylon = itemId;
-            } else if (itemType === 'EPBItemType::Mobility' && allowed('mobilityScope')) {
-              role.mobilityModule = itemId;
-            } else if (itemType === 'EPBItemType::MeleeWeapon' && allowed('meleeWeaponScope')) {
-              role.meleeWeapon = itemId;
-            } else {
-              console.log(`[ARCHIVE] Ignored slot update role=${roleId} op=${op} item=${itemId} type=${itemType || 'Unknown'}`);
-            }
-          } else if (skinData && skinData.length > 0) {
-            // Skin-only update (no item change)
-            try {
-              const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
-                .lookupType("ProjectBoundary.SkinPayload");
-              const skinObj = SkinType.toObject(SkinType.decode(skinData), ObjectOptions);
-              if (skinObj.TokenId) role._skinToken = skinObj.TokenId;
-              if (skinObj.OrnamentId) role._ornamentId = skinObj.OrnamentId;
-            } catch(_) {}
-          } else {
-            // Empty item = unequip
-            if (SLOT_MAP[op]) {
-              role[SLOT_MAP[op]] = 'None';
-            } else if (op === 1) {
-              // op=1 with empty item: unequip primary weapon so auto-detect
-              // can place the next equipped weapon into the primary slot
-              role.primaryWeapon = 'None';
-            }
-          }
-          // Save skin data if present
-          if (skinData && skinData.length > 0) {
-            role._skinData = skinData.toString('hex');
-            try {
-              const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
-                .lookupType("ProjectBoundary.SkinPayload");
-              const skinObj = SkinType.toObject(SkinType.decode(skinData), ObjectOptions);
-              if (skinObj.TokenId) role._skinToken = skinObj.TokenId;
-              if (skinObj.OrnamentId) role._ornamentId = skinObj.OrnamentId;
-            } catch(_) {}
-          }
-          store.save(playerId, data);
-        }
-
-        // Return success; the request body is decoded above only for the fields we persist.
-
-        // Test StatusCode=1 (some proto conventions use 1=success)
-        Root = protobuf.loadSync("./game/proto/Response/UpdateRoleArchiveV2.proto");
-        let UpdateRoleArchiveV2Type = Root.lookupType("ProjectBoundary.UpdateRoleArchiveV2Response");
-        let UpdateRoleArchiveV2 = UpdateRoleArchiveV2Type.create({StatusCode: 1});
-        let ResponseBytes = UpdateRoleArchiveV2Type.encode(UpdateRoleArchiveV2).finish();
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/assets.Assets/GetPlayerArchiveV2"){
-        console.log("[RECV] Player Archive V2!");
-
-        Root = protobuf.loadSync("./game/proto/Request/GetPlayerArchiveV2Request.proto");
-
-        let PlayerArchiveV2RequestType = Root.lookupType("ProjectBoundary.GetPlayerArchiveV2Request");
-
-        let PlayerArchiveV2Request = PlayerArchiveV2RequestType.decode(MessageBytes);
-
-        let PlayerArchiveV2RequestObj = PlayerArchiveV2RequestType.toObject(PlayerArchiveV2Request, ObjectOptions);
-
-        const store = getLoadoutStore();
-        const playerId = socket.playerId || TEMP_USER_ID;
-        const roleIds = PlayerArchiveV2RequestObj.RoleIDs || [];
-        const playerRoleDatas = store.getRoleArchive(playerId, roleIds);
-        const fullData = store.load(playerId);
-        const roles = (fullData && fullData.roles) || {};
-
-        // Attach weapon archive and skin data
-        for (const roleData of playerRoleDatas) {
-          const savedRole = roles[roleData.RoleID] || {};
-          const defaultSkin = store.getDefaultRoleSkinMetadata(roleData.RoleID);
-          roleData.WeaponArchiveRaw = store.getWeaponArchiveRawForRole(savedRole, roleData.PrimaryWeapon, roleData.RoleID);
-          roleData.SkinToken = savedRole._skinToken || defaultSkin.skinToken || '';
-          roleData.OrnamentId = savedRole._ornamentId || defaultSkin.ornamentId || '';
-          if (savedRole._skinData) {
-            try {
-              const SkinType = protobuf.loadSync("./game/proto/Request/UpdateRoleArchiveV2Request.proto")
-                .lookupType("ProjectBoundary.SkinPayload");
-              const skinObj = SkinType.toObject(SkinType.decode(Buffer.from(savedRole._skinData, 'hex')), ObjectOptions);
-              roleData.SkinToken = skinObj.TokenId || roleData.SkinToken;
-              roleData.OrnamentId = skinObj.OrnamentId || roleData.OrnamentId;
-            } catch(_) {}
-          }
-        }
-
-        let ResponseObj = {PlayerRoleDatas: playerRoleDatas, PlayerLevel: 0};
-        console.log("[ARCHIVE] Returning loadout data:", JSON.stringify(ResponseObj));
-
-        Root = protobuf.loadSync("./game/proto/Response/GetPlayerArchiveV2Response.proto");
-
-        let PlayerArchiveV2ResponseType = Root.lookupType("ProjectBoundary.GetPlayerArchiveV2Response");
-
-        let PlayerArchiveV2Response = PlayerArchiveV2ResponseType.create(ResponseObj);
-
-        let ResponseBytes = PlayerArchiveV2ResponseType.encode(PlayerArchiveV2Response).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/assets.Assets/QueryAssets"){
-        console.log("[RECV] Query Assets!");
-
-        Root = protobuf.loadSync("./game/proto/Response/QueryAssetsResponse.proto");
-
-        let QueryAssetsResponseType = Root.lookupType("ProjectBoundary.QueryAssetsResponse");
-
-        let ResponseObj = {ItemDatas: [], ItemCount: 0};
-        const index = getDefinitionIndex();
-
-        for(let itemId of index.itemTypes.keys()){
-          ResponseObj.ItemDatas.push({
-            ItemId: itemId,
-            Unknown1: 1,
-            Unknown2: 1,
-            Unknown3: 1
-          });
-        }
-
-        ResponseObj.ItemCount = ResponseObj.ItemDatas.length;
-        console.log(`[ASSETS] Returning ${ResponseObj.ItemCount} items`);
-
-        let QueryAssetsResponse = QueryAssetsResponseType.create(ResponseObj);
-
-        let ResponseBytes = QueryAssetsResponseType.encode(QueryAssetsResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/notification.Notification/QueryNotification"){
-        //console.log("[RECV] Query Notification!");
-
-        Root = protobuf.loadSync("./game/proto/Request/QueryNotificationRequest.proto");
-
-        let QueryNotificationRequestType = Root.lookupType("ProjectBoundary.QueryNotificationRequest");
-
-        let QueryNotificationRequest = QueryNotificationRequestType.decode(MessageBytes);
-
-        let QueryNotificationRequestObj = QueryNotificationRequestType.toObject(QueryNotificationRequest, ObjectOptions);
-
-        const Platform = QueryNotificationRequestObj.Platform;
-
-        const LanguageCode = QueryNotificationRequestObj.LanguageCode;
-
-        // translate it or smth idfk
-
-        Root = protobuf.loadSync("./game/proto/Response/QueryNotificationResponse.proto");
-
-        let QueryNotificationResponseType = Root.lookupType("ProjectBoundary.QueryNotificationResponse");
-
-        let QueryNotificationResponse = QueryNotificationResponseType.create({Unknown: 0, Notifications: [BuildNotification("4/01/2026 Patchnotes", PATCHNOTES_4012026_TEXT, "", LanguageCode, Platform, "America/New_York"), BuildNotification("3/31/2026 Patchnotes", PATCHNOTES_3312026_TEXT, "", LanguageCode, Platform, "America/New_York"), BuildNotification("Project Rebound Alpha", ALPHA_TEXT, "", LanguageCode, Platform, "America/New_York")]});
-
-        let ResponseBytes = QueryNotificationResponseType.encode(QueryNotificationResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/party.party/Create"){
-        //console.log("[RECV] Party Create!");
-        
-        Root = protobuf.loadSync("./game/proto/Response/CreatePartyResponse.proto");
-
-        let CreatePartyResponseType = Root.lookupType("ProjectBoundary.CreatePartyResponse");
-
-        let CreatePartyResponse = CreatePartyResponseType.create({StatusCode: 0, PartyId: crypto.randomUUID().toString(), PartyMembers: [TEMP_USER_ID]});
-
-        let ResponseBytes = CreatePartyResponseType.encode(CreatePartyResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/party.party/Ready"){
-        //console.log("[RECV] Party Ready!");
-
-        Root = protobuf.loadSync("./game/proto/Request/PartyReadyRequest.proto");
-
-        let PartyReadyRequestType = Root.lookupType("ProjectBoundary.PartyReadyRequest");
-
-        let PartyReadyRequest = PartyReadyRequestType.decode(MessageBytes);
-
-        let PartyReadyRequestObj = PartyReadyRequestType.toObject(PartyReadyRequest, ObjectOptions);
-
-        const PartyId = PartyReadyRequestObj.PartyId;
-        
-        Root = protobuf.loadSync("./game/proto/Response/PartyReadyResponse.proto");
-
-        let PartyReadyResponseType = Root.lookupType("ProjectBoundary.PartyReadyResponse");
-
-        let PartyReadyResponse = PartyReadyResponseType.create({StatusCode: 0});
-
-        let ResponseBytes = PartyReadyResponseType.encode(PartyReadyResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/party.party/Get"){
-        console.log("[RECV] Get Party!");
-
-        const empty = Buffer.alloc(0);
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, empty));
-      }
-      else if(RPCPath === "/chat.chat/TextFilter"){
-        console.log("[RECV] Text Filter!");
-
-        // Echo back empty success — missing response was causing
-        // LogicServer ErrorCode=-1 timeouts during armory init.
-        const empty = Buffer.alloc(0);
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, empty));
-      }
-      else if(RPCPath === "/party.party/SetPresence"){
-        //console.log("[RECV] Set Party Presence!");
-        
-        Root = protobuf.loadSync("./game/proto/Request/SetPartyPresenceRequest.proto");
-
-        let SetPartyPresenceRequestType = Root.lookupType("ProjectBoundary.SetPartyPresenceRequest");
-
-        let SetPartyPresenceRequest = SetPartyPresenceRequestType.decode(MessageBytes);
-
-        let SetPartyPresenceRequestObj = SetPartyPresenceRequestType.toObject(SetPartyPresenceRequest, ObjectOptions);
-
-        const DecodedPartyPresence = SetPartyPresenceRequestObj.Presence;
-
-        console.log(`[PARTY] Presence ${PartyPresence} => ${DecodedPartyPresence}`);
-
-        PartyPresence = DecodedPartyPresence;
-
-        Root = protobuf.loadSync("./game/proto/Response/SetPartyPresenceResponse.proto");
-
-        let SetPartyPresenceResponseType = Root.lookupType("ProjectBoundary.SetPartyPresenceResponse");
-
-        let SetPartyPresenceResponse = SetPartyPresenceResponseType.create({StatusCode: 0});
-
-        let ResponseBytes = SetPartyPresenceResponseType.encode(SetPartyPresenceResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/party.party/QueryPresence"){
-        //console.log("[RECV] Query Party Presence!");
-
-        Root = protobuf.loadSync("./game/proto/Response/QueryPartyPresenceResponse.proto");
-
-        let QueryPartyPresenceResponseType = Root.lookupType("ProjectBoundary.QueryPartyPresenceResponse");
-
-        let QueryPartyPresenceResponse = QueryPartyPresenceResponseType.create({StatusCode: 0, PartyMembers: [{
-          UserId: TEMP_USER_ID,
-          Status: PartyPresence
-        }]});
-
-        let ResponseBytes = QueryPartyPresenceResponseType.encode(QueryPartyPresenceResponse).finish();
-
-        //console.log(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes).toString("hex"));
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/matchmaking.Matchmaking/QueryUnityMatchmakingRegion"){
-        console.log("[RECV] Query Matchmaking Region!");
-
-        Root = protobuf.loadSync("./game/proto/Response/QueryMatchmakingRegionResponse.proto");
-
-        let QueryMatchmakingRegionResponseType = Root.lookupType("ProjectBoundary.QueryMatchmakingRegionResponse");
-
-        let QueryMatchmakingRegionResponse = QueryMatchmakingRegionResponseType.create({StatusCode: 0, Regions: BuildRegionList()});
-
-        let ResponseBytes = QueryMatchmakingRegionResponseType.encode(QueryMatchmakingRegionResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/matchmaking.Matchmaking/StartUnityMatchmaking"){
-        console.log("[RECV] Start Matchmaking!");
-
-        let userId = '';
-        let gameMode = 'Purge';
-        let regionIds = [];
-        try {
-          Root = protobuf.loadSync("./game/proto/Request/StartMatchmakingRequest.proto");
-          let ReqType = Root.lookupType("ProjectBoundary.StartMatchmakingRequest");
-          let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
-          userId = req.Payload.MatchmakingRequestorUserId || TEMP_USER_ID;
-          gameMode = req.GameMode || 'Purge';
-          regionIds = (req.Payload.UnknownMessage || []).map(m => m.RegionId).filter(Boolean);
-        } catch(e) {
-          console.log("[MATCH] Failed to decode StartMatchmaking:", e.message);
-        }
-
-        // Try MatchServer API; fall back to in-memory ticket
-        let ticketId = generateTicketId();
-        let matchFound = false;
-        try {
-          const result = await matchServerRequest('POST', '/matchmaking/enqueue', {
-            userId, regionIds, gameMode, ticketId,
-          });
-          ticketId = result.ticketId || ticketId;
-          matchFound = result.status === 'found';
-          if (matchFound) {
-            matchTickets.set(ticketId, {
-              userId, gameMode, regionIds,
-              status: 'found',
-              serverIp: result.serverIp,
-              serverPort: result.serverPort,
-              createdAt: Date.now(),
-            });
-          }
-          console.log(`[MATCH] MatchServer: ticket=${ticketId} status=${result.status}`);
-        } catch(_) {
-          // MatchServer unavailable - queue locally
-          matchTickets.set(ticketId, {
-            userId, gameMode, regionIds,
-            status: 'queued',
-            serverIp: null, serverPort: null,
-            createdAt: Date.now(),
-          });
-          console.log(`[MATCH] MatchServer unavailable, queued locally: ticket=${ticketId}`);
-        }
-
-        Root = protobuf.loadSync("./game/proto/Response/StartMatchmakingResponse.proto");
-        let RespType = Root.lookupType("ProjectBoundary.StartMatchmakingResponse");
-        let Resp = RespType.create({StatusCode: 0});
-        let ResponseBytes = RespType.encode(Resp).finish();
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/matchmaking.Matchmaking/QueryUnityMatchmaking"){
-        // Parse ticketId from request
-        let ticketId = '';
-        try {
-          Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
-          let ReqType = Root.lookupType("ProjectBoundary.QueryUnityMatchmakingReq");
-          let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
-          ticketId = req.ticketId || '';
-        } catch(_) {}
-
-        let status = 'queued', serverIp = '', serverPort = 0;
-        if (ticketId && matchTickets.has(ticketId)) {
-          const ticket = matchTickets.get(ticketId);
-          status = ticket.status;
-          serverIp = ticket.serverIp || '';
-          serverPort = ticket.serverPort || 0;
-        }
-
-        // Poll MatchServer if available
-        if (ticketId && status === 'queued') {
-          try {
-            const result = await matchServerRequest('GET', `/matchmaking/status/${ticketId}`);
-            if (result.status === 'found') {
-              const ticket = matchTickets.get(ticketId);
-              if (ticket) {
-                ticket.status = 'found';
-                ticket.serverIp = result.serverIp;
-                ticket.serverPort = result.serverPort;
-              }
-              status = 'found';
-              serverIp = result.serverIp;
-              serverPort = result.serverPort;
-            }
-          } catch(_) {}
-        }
-
-        // Return empty response (QueryUnityMatchmakingRes has no known fields)
-        Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
-        let RespType = Root.lookupType("ProjectBoundary.QueryUnityMatchmakingRes");
-        let Resp = RespType.create({});
-        let ResponseBytes = RespType.encode(Resp).finish();
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/matchmaking.Matchmaking/StopUnityMatchmaking"){
-        let ticketId = '';
-        try {
-          Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
-          let ReqType = Root.lookupType("ProjectBoundary.StopUnityMatchmakingReq");
-          let req = ReqType.toObject(ReqType.decode(MessageBytes), ObjectOptions);
-          ticketId = req.ticketId || '';
-        } catch(_) {}
-
-        console.log(`[MATCH] Stop matchmaking: ticket=${ticketId}`);
-        if (ticketId) {
-          matchTickets.delete(ticketId);
-          try {
-            await matchServerRequest('POST', `/matchmaking/cancel/${ticketId}`);
-          } catch(_) {}
-        }
-
-        Root = protobuf.loadSync("./game/proto/Response/matchmaking_ext.proto");
-        let RespType = Root.lookupType("ProjectBoundary.StopUnityMatchmakingRes");
-        let Resp = RespType.create({});
-        let ResponseBytes = RespType.encode(Resp).finish();
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/playerdata.PlayerDataClient/GetDataStatisticsInfo"){
-        //console.log("[RECV] Get Data Statistics!");
-
-        Root = protobuf.loadSync("./game/proto/Response/GetDataStatisticsInfoResponse.proto");
-
-        let GetDataStatisticsInfoResponseType = Root.lookupType("ProjectBoundary.GetDataStatisticsInfoResponse");
-
-        let GetDataStatisticsInfoResponse = GetDataStatisticsInfoResponseType.create({StatusCode: 0, Datapoints: []});
-
-        let ResponseBytes = GetDataStatisticsInfoResponseType.encode(GetDataStatisticsInfoResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/matchmaking.Matchmaking/QueryPlayList"){
-        console.log("[RECV] Query Playlists!");
-
-        Root = protobuf.loadSync("./game/proto/Response/QueryPlaylistResponse.proto");
-
-        let QueryPlaylistResponseType = Root.lookupType("ProjectBoundary.QueryPlaylistResponse");
-
-        let QueryPlaylistResponse = QueryPlaylistResponseType.create({StatusCode: 0, PlaylistsJSON: JSON.stringify(PLAYLISTS_JSON)});
-
-        let ResponseBytes = QueryPlaylistResponseType.encode(QueryPlaylistResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/profile.Profile/QueryCurrency"){
-        //console.log("[RECV] Query Currency!");
-
-        Root = protobuf.loadSync("./game/proto/Response/QueryCurrencyResponse.proto");
-
-        let QueryCurrencyResponseType = Root.lookupType("ProjectBoundary.QueryCurrencyResponse");
-
-        let QueryCurrencyResponse = QueryCurrencyResponseType.create({CurrencyA: 0, CurrencyB: 0, CurrencyC: 0, CurrencyD: 0, CurrencyE: 0});
-
-        let ResponseBytes = QueryCurrencyResponseType.encode(QueryCurrencyResponse).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/assets.Assets/UpdateWeaponArchiveV2"){
-        console.log(`[RECV] Update Weapon Archive V2! (${MessageBytes ? MessageBytes.length : 0} bytes)`);
-
-        let weaponRoleId = '';
-        let waParsed = null;
-        if (MessageBytes && MessageBytes.length > 0) {
-          try {
-            const WARoot = protobuf.loadSync("./game/proto/Request/UpdateWeaponArchiveV2Request.proto");
-            const WAReqType = WARoot.lookupType("ProjectBoundary.UpdateWeaponArchiveV2Request");
-            waParsed = WAReqType.toObject(WAReqType.decode(MessageBytes), ObjectOptions);
-            weaponRoleId = waParsed.RoleId || '';
-            if (waParsed.WeaponArchive) {
-              console.log(`[WEAPON] role=${weaponRoleId} weapon=${waParsed.WeaponArchive.WeaponId} slots=${(waParsed.WeaponArchive.Parts || []).length}`);
-            }
-          } catch(e) {
-            console.log(`[WEAPON] Failed to decode: ${e.message}`);
-            // Fallback: parse roleId from raw bytes
-            if (MessageBytes[0] === 0x0a) {
-              const len = MessageBytes[1];
-              if (len < 128) weaponRoleId = MessageBytes.subarray(2, 2 + len).toString('utf-8');
-            }
-          }
-        }
-
-        if (weaponRoleId) {
-          const store = getLoadoutStore();
-          const playerId = socket.playerId || TEMP_USER_ID;
-          const data = store.load(playerId) || { playerId, roles: {} };
-          if (!data.roles[weaponRoleId]) data.roles[weaponRoleId] = {};
-
-          const role = data.roles[weaponRoleId];
-          const rawHex = MessageBytes ? MessageBytes.toString('hex') : '';
-          const archiveWeaponId = waParsed && waParsed.WeaponArchive && waParsed.WeaponArchive.WeaponId
-            ? waParsed.WeaponArchive.WeaponId
-            : '';
-          if (!role._weaponArchives || typeof role._weaponArchives !== 'object' || Array.isArray(role._weaponArchives)) {
-            role._weaponArchives = {};
-          }
-          if (archiveWeaponId) {
-            role._weaponArchives[archiveWeaponId] = rawHex;
-          }
-          // Backward-compatible field for old clients; the per-weapon map remains authoritative.
-          role._weaponArchiveRaw = rawHex;
-
-          // Weapon skin/ornament are part of the per-weapon raw archive. Do not
-          // copy them into role skin fields used by PlayerRoleData.
-          store.save(playerId, data);
-        }
-
-        Root = protobuf.loadSync("./game/proto/Response/UpdateRoleArchiveV2.proto");
-        let RespType = Root.lookupType("ProjectBoundary.UpdateRoleArchiveV2Response");
-        let Resp = RespType.create({StatusCode: 0});
-        let ResponseBytes = RespType.encode(Resp).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/mission.Mission/QueryProgress"){
-        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
-
-        let QueryProgressRespType = Root.lookupType("ProjectBoundary.QueryProgressResp");
-
-        let QueryProgressResp = QueryProgressRespType.create({});
-
-        let ResponseBytes = QueryProgressRespType.encode(QueryProgressResp).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/event.Event/QueryOperatingEvent"){
-        Root = protobuf.loadSync("./game/proto/Response/event.proto");
-
-        let QueryOperatingEventRespType = Root.lookupType("ProjectBoundary.QueryOperatingEventResp");
-
-        let QueryOperatingEventResp = QueryOperatingEventRespType.create({});
-
-        let ResponseBytes = QueryOperatingEventRespType.encode(QueryOperatingEventResp).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/eventtracking.EventTracking/Record"){
-        Root = protobuf.loadSync("./game/proto/Response/eventtracking.proto");
-
-        let RecordRespType = Root.lookupType("ProjectBoundary.RecordResp");
-
-        let RecordResp = RecordRespType.create({});
-
-        let ResponseBytes = RecordRespType.encode(RecordResp).finish();
-
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/mission.Mission/QueryLoginRecord"){
-        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
-        let RespType = Root.lookupType("ProjectBoundary.QueryLoginRecordResp");
-        let Resp = RespType.create({});
-        let ResponseBytes = RespType.encode(Resp).finish();
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/mission.Mission/QueryActivitiesInfo"){
-        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
-        let RespType = Root.lookupType("ProjectBoundary.QuestActivitiesInfoResp");
-        let Resp = RespType.create({});
-        let ResponseBytes = RespType.encode(Resp).finish();
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else if(RPCPath === "/mission.Mission/QueryUserEvents"){
-        Root = protobuf.loadSync("./game/proto/Response/mission.proto");
-        let RespType = Root.lookupType("ProjectBoundary.QueryUserEventsResp");
-        let Resp = RespType.create({});
-        let ResponseBytes = RespType.encode(Resp).finish();
-        socket.write(WrapMessageAndSerialize(MessageId, RPCPath, ResponseBytes));
-      }
-      else{
-        console.log("[RECV] Undefined Message:\n", {
-          path: RequestObj.RPCPath,
-          MessageId: RequestObj.MessageId
-        });
-
-        //socket.write(data);
-      }
+    const payloadLength = socket._recvBuffer.readUInt32BE(0);
+
+    // Malformed / absurd length — drop header byte and try to resync without crashing
+    if (
+      !Number.isFinite(payloadLength) ||
+      payloadLength < 0 ||
+      payloadLength > MAX_TCP_FRAME_PAYLOAD
+    ) {
+      logger.warn(
+        `[TCP] Malformed length header (${payloadLength}) from ${socket.remoteAddress}:${socket.remotePort}; discarding 1 byte`
+      );
+      socket._recvBuffer = socket._recvBuffer.subarray(1);
+      continue;
     }
+
+    const frameLength = TCP_LENGTH_HEADER_SIZE + payloadLength;
+    if (socket._recvBuffer.length < frameLength) {
+      return; // wait for rest of frame
     }
-    
 
+    const frameBytes = socket._recvBuffer.subarray(0, frameLength);
+    socket._recvBuffer = socket._recvBuffer.subarray(frameLength);
 
+    try {
+      processTcpFrame(socket, frameBytes);
+    } catch (err) {
+      logger.error(
+        `[TCP] Frame processing error from ${socket.remoteAddress}:${socket.remotePort}:`,
+        err && err.stack ? err.stack : err
+      );
+    }
+  }
+}
+
+const server = net.createServer((socket) => {
+  logger.info("\n=== Client connected ===");
+  logger.info(`From: ${socket.remoteAddress}:${socket.remotePort}\n`);
+
+  socket._recvBuffer = Buffer.alloc(0);
+
+  socket.on("data", (chunk) => {
+    try {
+      onTcpData(socket, chunk);
+    } catch (err) {
+      logger.error(
+        `[TCP] Receive buffer error from ${socket.remoteAddress}:${socket.remotePort}:`,
+        err && err.stack ? err.stack : err
+      );
+    }
   });
 
-  socket.on('end', () => {
-    console.log('\n=== Client disconnected ===\n');
-  });
-
-  socket.on('error', (err) => {
-    console.error('Socket error:', err);
-  });
+  socket.on("end", () => logger.info("\n=== Client disconnected ===\n"));
+  socket.on("error", (err) => logger.error("Socket error:", err));
 });
 
-let udp = require("dgram");
-const { serialize } = require('v8');
+// =============================================================================
+//  UDP Matchmaking (port MATCHMAKING_PORT)
+// =============================================================================
 
-const matchmakingUDPServer = udp.createSocket('udp4');
+const matchmakingUDPServer = udp.createSocket("udp4");
 
 matchmakingUDPServer.on("error", (error) => {
-  console.log("[MM] Server blew up!");
-  console.log(error.toString());
+  logger.info("[MM] Server blew up!");
+  logger.info(error.toString());
   matchmakingUDPServer.close();
 });
 
 matchmakingUDPServer.on("close", () => {
-  console.log("[MM] Shutdown!");
+  logger.info("[MM] Shutdown!");
 });
 
 matchmakingUDPServer.on("message", (message, info) => {
-  if(message[0] == 0x59){
-    console.log("[MM] Recieved a new QoS message, echoing!");
-    
-    let header = Buffer.alloc(3);
-
-    header[0] = 0x95;
+  if (message[0] == QOS_REQUEST_BYTE) {
+    logger.info("[MM] Received a new QoS message, echoing!");
+    const header = Buffer.alloc(3);
+    header[0] = QOS_RESPONSE_BYTE;
     header[1] = 0x00;
-
     const resp = Buffer.concat([header, message.subarray(11)]);
-
-    matchmakingUDPServer.send(resp, info.port, info.address, (error, bytesSend) => {
-      console.log("Sent Info\n", {
-        error: error,
-        bytesSent: bytesSend,
+    matchmakingUDPServer.send(resp, info.port, info.address, (error, bytesSent) => {
+      logger.info("Sent Info\n", {
+        error,
+        bytesSent,
         addr: info.address,
         port: info.port,
         req: message.toString("hex"),
-        resp: resp.toString("hex")
+        resp: resp.toString("hex"),
       });
     });
-  }
-  else{
-    console.log("[MM] Recv'd an unknown message!");
-    console.log(message);
+  } else {
+    logger.info("[MM] Recv'd an unknown message!");
+    logger.info(message);
   }
 });
 
 matchmakingUDPServer.on("listening", () => {
-  console.log(`mrooooow >.< - ${9000}`);
+  logger.info(`mrooooow >.< - ${MATCHMAKING_PORT}`);
 });
 
 const matchmakingTCPServer = net.createServer((socket) => {
-  console.log('\n=== Client connected ===');
-  console.log(`From: ${socket.remoteAddress}:${socket.remotePort}\n`);
-
-  socket.on('data', (rawdata) => {
-    console.log("MOGGEDDDDDDDDD");
+  logger.info("\n=== Client connected ===");
+  logger.info(`From: ${socket.remoteAddress}:${socket.remotePort}\n`);
+  socket.on("data", (rawdata) => {
+    logger.info("MOGGEDDDDDDDDD");
   });
 });
 
-app.listen(process.env.PORT || 8000, () => {
-    console.log(`mrow :3 - ${process.env.PORT || 8000}`);
+// =============================================================================
+//  Startup
+// =============================================================================
 
-    server.listen(6969, () => {
-      console.log(`miau >:3 - ${6969}`);
-
-      matchmakingUDPServer.bind(9000);
-
-      matchmakingTCPServer.listen(9000);
-    })
+app.listen(HTTP_PORT, () => {
+  logger.info(`mrow :3 - ${HTTP_PORT}`);
+  server.listen(RPC_PORT, () => {
+    logger.info(`miau >:3 - ${RPC_PORT}`);
+    matchmakingUDPServer.bind(MATCHMAKING_PORT);
+    matchmakingTCPServer.listen(MATCHMAKING_PORT);
+  });
 });
