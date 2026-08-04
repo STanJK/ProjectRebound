@@ -1,41 +1,63 @@
-// AutoConnect.cpp
 #include "AutoConnect.h"
+
+#include "../API/APIInternal.h"
+#include "../API/CommandProtocol.h"
 #include "../Config/Config.h"
 #include "../Logging/LogManager.h"
-#include "../API/APIInternal.h"
+#include "../SDK.hpp"
 #include "../SDK/Engine_parameters.hpp"
 #include "../SDK/ProjectBoundary_parameters.hpp"
 #include "../Libs/json.hpp"
-#include <iostream>
-#include <fstream>
-#include <thread>
+
 #include <Windows.h>
+
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <mutex>
+#include <optional>
 
 using namespace SDK;
 
-bool LoginCompleted = false;
-bool ReadyToAutoconnect = false;
+namespace
+{
+    enum class ConnectStage
+    {
+        Idle,
+        Queued,
+        WaitingAfterLogin,
+        WaitingAfterRange
+    };
 
-// ======================================================
-//  Client logic
-// ======================================================
+    std::mutex connectMutex;
+    std::optional<std::string> pendingTarget;
+    std::string currentTarget;
+    ConnectStage connectStage = ConnectStage::Idle;
+    std::chrono::steady_clock::time_point nextActionAt{};
+    std::atomic<bool> loginCompleted{false};
+    std::atomic<DWORD> gameThreadId{0};
+
+    constexpr auto LoginSettleDelay = std::chrono::seconds(2);
+    constexpr auto RangeSettleDelay = std::chrono::seconds(1);
+}
 
 void InitClientArmory()
 {
-    for (UObject *obj : getObjectsOfClass(UPBArmoryManager::StaticClass(), false))
+    for (UObject* obj : getObjectsOfClass(UPBArmoryManager::StaticClass(), false))
     {
-        UPBArmoryManager *DefaultConfig = (UPBArmoryManager *)obj;
+        auto* DefaultConfig = static_cast<UPBArmoryManager*>(obj);
 
         std::ifstream items("DT_ItemType.json");
         nlohmann::json itemJson = nlohmann::json::parse(items);
 
-        for (auto &[ItemId, _] : itemJson[0]["Rows"].items())
+        for (auto& [ItemId, _] : itemJson[0]["Rows"].items())
         {
             std::string aString = std::string(ItemId.c_str());
             std::wstring wString = std::wstring(aString.begin(), aString.end());
 
             if (DefaultConfig->DefaultConfig)
-                DefaultConfig->DefaultConfig->OwnedItems.Add(UKismetStringLibrary::Conv_StringToName(wString.c_str()));
+                DefaultConfig->DefaultConfig->OwnedItems.Add(
+                    UKismetStringLibrary::Conv_StringToName(wString.c_str()));
 
             FPBItem item{};
             item.ID = UKismetStringLibrary::Conv_StringToName(wString.c_str());
@@ -47,102 +69,147 @@ void InitClientArmory()
     }
 }
 
+bool QueueConnectToMatch(const std::string& target)
+{
+    std::string validationError;
+    if (!CommandProtocol::ValidateMatchTarget(target, &validationError))
+    {
+        ClientDebugLog("[CLIENT] Rejected match target: " + validationError);
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(connectMutex);
+        if (pendingTarget.has_value())
+            return false;
+
+        pendingTarget = target;
+        connectStage = ConnectStage::Queued;
+    }
+    ClientDebugLog("[CLIENT] Match transition queued: " + target);
+    return true;
+}
+
 void ConnectToMatch()
 {
     std::string target;
     {
-        std::lock_guard<std::mutex> lock(MatchIPMutex);
-        if (MatchIP.empty())
-        {
-            ClientDebugLog("[CLIENT] Reconnect requested but no -match target is configured.");
-            return;
-        }
-        target = MatchIP;
+        std::lock_guard<std::mutex> lock(connectMutex);
+        target = currentTarget;
     }
 
-    UPBGameInstance *GameInstance =
-        (UPBGameInstance *)UWorld::GetWorld()->OwningGameInstance;
-
-    GameInstance->ShowLoadingScreen(false, true);
-
-    UPBLocalPlayer *LocalPlayer =
-        (UPBLocalPlayer *)(UWorld::GetWorld()->OwningGameInstance->LocalPlayers[0]);
-
-    LocalPlayer->GoToRange(0.0f);
-
-    std::wstring travelCmd = L"travel " + std::wstring(target.begin(), target.end());
-    ClientDebugLog("[CLIENT] Reconnecting to match: " + target);
-
-    UKismetSystemLibrary::ExecuteConsoleCommand(
-        UWorld::GetWorld(), travelCmd.c_str(), nullptr);
-
-    GameInstance->ShowLoadingScreen(true, true);
+    if (target.empty())
+    {
+        ClientDebugLog("[CLIENT] Reconnect requested without a current match target.");
+        return;
+    }
+    if (!QueueConnectToMatch(target))
+        ClientDebugLog("[CLIENT] Reconnect ignored because another transition is pending.");
 }
 
 void AutoConnectToMatchFromCmdline()
 {
-    std::thread([]()
-                {
-                    // Wait for world
-                    while (!UWorld::GetWorld())
-                        Sleep(100);
+    std::string target;
+    {
+        std::lock_guard<std::mutex> lock(MatchIPMutex);
+        target = MatchIP;
+    }
 
-                    // Wait for GameInstance
-                    while (!UWorld::GetWorld()->OwningGameInstance)
-                        Sleep(100);
+    if (!target.empty() && !QueueConnectToMatch(target))
+        ClientDebugLog("[CLIENT] Initial match target could not be queued.");
+}
 
-                    // Wait for LocalPlayer
-                    while (UWorld::GetWorld()->OwningGameInstance->LocalPlayers.Num() == 0)
-                        Sleep(100);
+bool NotifyClientLoginCompleted()
+{
+    gameThreadId.store(GetCurrentThreadId());
+    return !loginCompleted.exchange(true);
+}
 
-                    // Wait for login complete
-                    while (!LoginCompleted)
-                        Sleep(100);
+void PumpPendingClientCommands()
+{
+    static thread_local bool pumping = false;
+    if (pumping || !loginCompleted.load() ||
+        gameThreadId.load() != GetCurrentThreadId())
+    {
+        return;
+    }
 
-                    // Delay to avoid main menu overriding the range transition
-                    Sleep(2000);
+    UWorld* const world = UWorld::GetWorld();
+    if (world == nullptr || world->OwningGameInstance == nullptr ||
+        world->OwningGameInstance->LocalPlayers.Num() == 0)
+    {
+        return;
+    }
 
-                    // Enter Shooting Range
-                    auto *GI = UWorld::GetWorld()->OwningGameInstance;
-                    UPBLocalPlayer *LP = (UPBLocalPlayer *)GI->LocalPlayers[0];
+    auto* const localPlayer = static_cast<UPBLocalPlayer*>(
+        world->OwningGameInstance->LocalPlayers[0]);
+    if (localPlayer == nullptr)
+        return;
 
-                    if (LP)
-                    {
-                        ClientDebugLog("[CLIENT] Auto-enter Shooting Range...");
-                        LP->GoToRange(0.0f);
-                    }
+    const auto now = std::chrono::steady_clock::now();
+    bool enterRange = false;
+    std::optional<std::string> connectTarget;
 
-                    // Give travel a moment to initialize
-                    Sleep(1000);
+    {
+        std::lock_guard<std::mutex> lock(connectMutex);
+        if (!pendingTarget.has_value())
+            return;
 
-                    ReadyToAutoconnect = true;
+        if (connectStage == ConnectStage::Queued)
+        {
+            connectStage = ConnectStage::WaitingAfterLogin;
+            nextActionAt = now + LoginSettleDelay;
+            return;
+        }
+        if (now < nextActionAt)
+            return;
 
-                    // Wait for flag
-                    while (!ReadyToAutoconnect)
-                        Sleep(100);
+        if (connectStage == ConnectStage::WaitingAfterLogin)
+            enterRange = true;
+        else if (connectStage == ConnectStage::WaitingAfterRange)
+            connectTarget = pendingTarget;
+    }
 
-                    Sleep(200);
+    pumping = true;
+    bool actionSucceeded = false;
+    try
+    {
+        if (enterRange)
+        {
+            ClientDebugLog("[CLIENT] Entering Shooting Range before match transition...");
+            localPlayer->GoToRange(0.0f);
+            actionSucceeded = true;
+        }
+        else if (connectTarget.has_value())
+        {
+            const std::wstring command = L"open " +
+                std::wstring(connectTarget->begin(), connectTarget->end());
+            ClientDebugLog("[CLIENT] Connecting to match: " + *connectTarget);
+            UKismetSystemLibrary::ExecuteConsoleCommand(world, command.c_str(), nullptr);
+            actionSucceeded = true;
+        }
+    }
+    catch (...)
+    {
+        ClientDebugLog("[CLIENT] Match transition failed on the game thread.");
+    }
+    pumping = false;
 
-                    // Connect to match
-                    std::string target;
-                    {
-                        std::lock_guard<std::mutex> lock(MatchIPMutex);
-                        target = MatchIP;
-                    }
+    if (!actionSucceeded)
+        return;
 
-                    if (target.empty())
-                    {
-                        ClientDebugLog("[CLIENT] Auto-connect requested but no -match target is configured.");
-                        return;
-                    }
-
-                    std::wstring wcmd = L"open " + std::wstring(target.begin(), target.end());
-                    ClientDebugLog("[CLIENT] Auto-connecting to match: " + target);
-
-                    UKismetSystemLibrary::ExecuteConsoleCommand(
-                        UWorld::GetWorld(),
-                        wcmd.c_str(),
-                        nullptr);
-                })
-        .detach();
+    std::lock_guard<std::mutex> lock(connectMutex);
+    if (enterRange && connectStage == ConnectStage::WaitingAfterLogin)
+    {
+        connectStage = ConnectStage::WaitingAfterRange;
+        nextActionAt = std::chrono::steady_clock::now() + RangeSettleDelay;
+    }
+    else if (connectTarget.has_value() &&
+        connectStage == ConnectStage::WaitingAfterRange &&
+        pendingTarget == connectTarget)
+    {
+        currentTarget = *connectTarget;
+        pendingTarget.reset();
+        connectStage = ConnectStage::Idle;
+    }
 }

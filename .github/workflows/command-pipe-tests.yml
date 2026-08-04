@@ -1,0 +1,38 @@
+name: Command pipe tests
+
+on:
+  push:
+    paths:
+      - "ProjectReboundMainDLL/API/CommandProtocol.*"
+      - "ProjectReboundMainDLL/API/ExternalCommandPipe.*"
+      - "ProjectReboundMainDLL/Tests/**"
+      - ".github/workflows/command-pipe-tests.yml"
+  pull_request:
+    paths:
+      - "ProjectReboundMainDLL/API/CommandProtocol.*"
+      - "ProjectReboundMainDLL/API/ExternalCommandPipe.*"
+      - "ProjectReboundMainDLL/Tests/**"
+      - ".github/workflows/command-pipe-tests.yml"
+
+jobs:
+  portable-protocol:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S ProjectReboundMainDLL/Tests -B build/command-pipe-tests -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build/command-pipe-tests --parallel
+      - name: Test
+        run: ctest --test-dir build/command-pipe-tests --output-on-failure
+
+  windows-named-pipe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        run: cmake -S ProjectReboundMainDLL/Tests -B build/command-pipe-tests -A x64
+      - name: Build
+        run: cmake --build build/command-pipe-tests --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build/command-pipe-tests -C Release --output-on-failure

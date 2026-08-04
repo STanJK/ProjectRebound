@@ -6,6 +6,7 @@
 #include <fstream>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <mutex>
 
 #include "../SDK.hpp"
@@ -35,28 +36,48 @@ using namespace SDK;
 uintptr_t BaseAddress = 0x0;
 LibReplicate* libReplicate = nullptr; // was static in original, but extern needed by other modules
 ExternalCommandPipe* g_CmdFramework = nullptr;
+static std::mutex g_CmdFrameworkMutex;
 
 // ======================================================
 //  Pipe join callback
 // ======================================================
 
-static void OnJoinFromPipe(const std::string& ip, const std::string& token)
+static bool OnJoinFromPipe(const std::string& ip, const std::string& token)
 {
     (void)token;
 
     ClientDebugLog("[PIPE] Join request received: " + ip);
+    return QueueConnectToMatch(ip);
+}
+
+// Process termination is left to Windows. Explicit DLL unloaders must call
+// this outside DllMain so Stop() can join without holding the loader lock.
+extern "C" __declspec(dllexport) void ShutdownPayloadCommandFramework()
+{
+    ExternalCommandPipe* framework = nullptr;
+    bool calledFromListener = false;
     {
-        std::lock_guard<std::mutex> lock(MatchIPMutex);
-        MatchIP = ip;
+        std::lock_guard<std::mutex> lock(g_CmdFrameworkMutex);
+        if (g_CmdFramework != nullptr && g_CmdFramework->IsListenerThread())
+        {
+            calledFromListener = true;
+        }
+        else
+        {
+            framework = g_CmdFramework;
+            g_CmdFramework = nullptr;
+        }
     }
 
-    if (UWorld::GetWorld() && UWorld::GetWorld()->OwningGameInstance)
+    if (calledFromListener)
     {
-        ConnectToMatch();
+        ClientDebugLog("[PIPE] Shutdown must be requested by an external owner thread.");
+        return;
     }
-    else
+    if (framework != nullptr)
     {
-        AutoConnectToMatchFromCmdline();
+        framework->Stop();
+        delete framework;
     }
 }
 
@@ -70,6 +91,7 @@ BOOL APIENTRY DllMain(HMODULE hModule,
 {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH)
     {
+        DisableThreadLibraryCalls(hModule);
         std::thread t(MainThread);
         t.detach();
     }
@@ -193,11 +215,16 @@ void MainThread()
 
             if (!MatchPipeName.empty())
             {
-                g_CmdFramework = new ExternalCommandPipe();
-                g_CmdFramework->SetPipeName(MatchPipeName);
-                g_CmdFramework->SetJoinCallback(OnJoinFromPipe);
-                g_CmdFramework->SetLogCallback([](const std::string& msg) { ClientDebugLog(msg); });
-                g_CmdFramework->Start();
+                auto framework = std::make_unique<ExternalCommandPipe>();
+                framework->SetPipeName(MatchPipeName);
+                framework->SetJoinCallback(OnJoinFromPipe);
+                framework->SetLogCallback([](const std::string& msg) { ClientDebugLog(msg); });
+
+                if (framework->Start())
+                {
+                    std::lock_guard<std::mutex> lock(g_CmdFrameworkMutex);
+                    g_CmdFramework = framework.release();
+                }
             }
 
             bool hasInitialMatchTarget = false;

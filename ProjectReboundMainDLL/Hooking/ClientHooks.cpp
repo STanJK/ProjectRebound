@@ -48,11 +48,8 @@ void ProcessEventHookClient(UObject *Object, UFunction *Function, void *Parms)
     // Detect login complete via MainMenuBase Construct
     if (EventInfo.ClientKind == EClientProcessEventKind::MainMenuConstruct)
     {
-        if (!LoginCompleted)
-        {
-            LoginCompleted = true;
+        if (NotifyClientLoginCompleted())
             LoadoutFix_FetchAndLog();
-        }
     }
 
     if (EventInfo.ClientKind == EClientProcessEventKind::ConnectMatchServerTimeout)
@@ -86,6 +83,10 @@ void ProcessEventHookClient(UObject *Object, UFunction *Function, void *Parms)
     HandleEquipErrorSwallow(Object, Function, Parms, EventInfo.FullName);
 
     ProcessEventClient.call(Object, Function, Parms);
+
+    // Execute pipe-originated Unreal work only after the original callback,
+    // on the game thread captured by the login-complete event.
+    PumpPendingClientCommands();
 
     // After BP callback ran, flush any pending equip display refresh
     LoadoutFix_FlushRefresh();

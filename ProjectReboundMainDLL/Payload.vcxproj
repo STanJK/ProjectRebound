@@ -147,6 +147,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="Core\GameOffsets.h" />
+    <ClInclude Include="API\CommandProtocol.h" />
     <ClInclude Include="API\ExternalCommandPipe.h" />
     <ClInclude Include="framework.h" />
   </ItemGroup>
@@ -171,6 +172,7 @@
     <ClCompile Include="Client\SideMountFixClient.cpp" />
     <ClCompile Include="Client\UIShake.cpp" />
     <ClCompile Include="API\APIInternal.cpp" />
+    <ClCompile Include="API\CommandProtocol.cpp" />
     <ClCompile Include="API\ExternalCommandPipe.cpp" />
     <ClCompile Include="Loadout\LoadoutFix.cpp" />
     <ClCompile Include="Libs\safetyhook.cpp" />
