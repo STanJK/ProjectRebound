@@ -7,6 +7,11 @@
 // Central server ip
 std::string OnlineBackendAddress = "";
 
+// Server registration
+std::string RegistrationToken = "";
+std::string g_ServerId = "";
+std::string g_ServerToken = "";
+
 // Room heartbeat credentials from the desktop browser/match server
 std::string HostRoomId = "";
 std::string HostToken = "";
@@ -136,6 +141,19 @@ void LoadConfig()
     {
         Config.ServerUniqueId = serverIdArg;
         ServerLog("[SERVER] Server ID: " + serverIdArg);
+    }
+
+    std::string tokenArg = GetCmdValue("-registrationtoken=");
+    if (!tokenArg.empty())
+    {
+        RegistrationToken = tokenArg;
+        ServerLog("[SERVER] Registration token received.");
+    }
+
+    MatchPipeName = GetCmdValue("-pipe=");
+    if (!MatchPipeName.empty())
+    {
+        ServerLog("[SERVER] Command pipe name: " + MatchPipeName);
     }
 }
 

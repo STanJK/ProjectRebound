@@ -16,6 +16,13 @@
 
 using namespace SDK;
 
+constexpr const char* BACKEND_PRIMARY  = "https://api.project-rebound.space";
+constexpr const char* BACKEND_FALLBACK = "https://cnapi.project-rebound.space";
+constexpr const char* REG_TOKEN_PLACEHOLDER = "YOUR_TOKEN_HERE";
+
+// Track which backend is currently working
+static std::string g_CurrentBackend = BACKEND_PRIMARY;
+
 namespace
 {
     bool BuildHttpTarget(const std::string &backend, std::string &host, INTERNET_PORT &port)
@@ -29,8 +36,11 @@ namespace
         size_t colon = cleanBackend.find(':');
         if (colon == std::string::npos)
         {
-            std::cout << "[ONLINE] Invalid backend address format." << std::endl;
-            return false;
+            // No port — use default based on scheme
+            host = cleanBackend;
+            bool isHttps = backend.rfind("https://", 0) == 0;
+            port = isHttps ? INTERNET_DEFAULT_HTTPS_PORT : INTERNET_DEFAULT_HTTP_PORT;
+            return true;
         }
 
         host = cleanBackend.substr(0, colon);
@@ -52,7 +62,9 @@ namespace
         }
     }
 
-    bool SendJsonPost(const std::string &backend, const std::string &path, const nlohmann::json &payload, const char *logPrefix)
+    bool SendJsonPost(const std::string &backend, const std::string &path,
+                      const nlohmann::json &payload, const char *logPrefix,
+                      const std::string &extraHeader = "")
     {
         if (IsServerShutdownRequested()) {
             OutputDebugStringA("[EXIT-GUARD] SendJsonPost skipped (shutdown)\n");
@@ -65,8 +77,9 @@ namespace
             return false;
 
         const std::string body = payload.dump();
+        bool isHttps = backend.rfind("https://", 0) == 0;
 
-        HINTERNET hSession = WinHttpOpen(L"BoundaryDLL/1.0",
+        HINTERNET hSession = WinHttpOpen(L"BoundaryDLL/0.7.0",
                                          WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                          WINHTTP_NO_PROXY_NAME,
                                          WINHTTP_NO_PROXY_BYPASS, 0);
@@ -84,14 +97,10 @@ namespace
         }
 
         std::wstring wpath(path.begin(), path.end());
+        DWORD flags = isHttps ? WINHTTP_FLAG_SECURE : 0;
         HINTERNET hRequest = WinHttpOpenRequest(
-            hConnect,
-            L"POST",
-            wpath.c_str(),
-            NULL,
-            WINHTTP_NO_REFERER,
-            WINHTTP_DEFAULT_ACCEPT_TYPES,
-            0);
+            hConnect, L"POST", wpath.c_str(),
+            NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
 
         if (!hRequest)
         {
@@ -100,14 +109,17 @@ namespace
             return false;
         }
 
+        // Build headers: Content-Type + optional extra header
+        std::wstring headers = L"Content-Type: application/json\r\n";
+        if (!extraHeader.empty())
+        {
+            std::wstring wExtra(extraHeader.begin(), extraHeader.end());
+            headers += wExtra + L"\r\n";
+        }
+
         BOOL ok = WinHttpSendRequest(
-            hRequest,
-            L"Content-Type: application/json",
-            -1,
-            (LPVOID)body.c_str(),
-            (DWORD)body.size(),
-            (DWORD)body.size(),
-            0);
+            hRequest, headers.c_str(), -1,
+            (LPVOID)body.c_str(), (DWORD)body.size(), (DWORD)body.size(), 0);
 
         if (ok)
             ok = WinHttpReceiveResponse(hRequest, NULL);
@@ -192,19 +204,70 @@ nlohmann::json BuildRoomHeartbeatPayload()
 // Send Message to Backend HTTP Helper
 void SendServerStatus(const std::string &backend)
 {
-    bool useRoomHeartbeat = !HostRoomId.empty() && !HostToken.empty();
-    nlohmann::json payload = useRoomHeartbeat ? BuildRoomHeartbeatPayload() : BuildServerStatusPayload();
-    if (!useRoomHeartbeat && !HostRoomId.empty())
+    // Token placeholder check — skip registration, print banner
+    if (RegistrationToken.empty() || RegistrationToken == REG_TOKEN_PLACEHOLDER)
     {
-        payload["roomId"] = HostRoomId;
-        payload["hostToken"] = HostToken;
+        static bool bannerShown = false;
+        if (!bannerShown)
+        {
+            bannerShown = true;
+            ServerLog("========================================");
+            ServerLog("  Registration token not configured.");
+            ServerLog("  Server running offline (not listed).");
+            ServerLog("  Contact admin for a valid token,");
+            ServerLog("  paste into serverconfig.json.");
+            ServerLog("========================================");
+        }
+        return;
     }
 
-    std::string path = useRoomHeartbeat
-                           ? "/v1/rooms/" + HostRoomId + "/heartbeat"
-                           : "/server/status";
+    bool useRoomHeartbeat = !HostRoomId.empty() && !HostToken.empty();
 
-    SendJsonPost(backend, path, payload, "[ONLINE]");
+    // If already registered, send heartbeat
+    if (!g_ServerId.empty() && !g_ServerToken.empty())
+    {
+        nlohmann::json payload;
+        payload["state"]          = "RUNNING";
+        payload["current_players"] = GetCurrentPlayerCount();
+
+        std::string path = "/v1/game-servers/" + g_ServerId + "/heartbeat";
+        std::string header = "X-Server-Token: " + g_ServerToken;
+
+        bool ok = SendJsonPost(backend, path, payload, "[ONLINE]", header);
+        if (!ok)
+        {
+            // Try fallback
+            std::string fb = (backend == BACKEND_PRIMARY) ? BACKEND_FALLBACK : BACKEND_PRIMARY;
+            ServerLog("[ONLINE] Primary failed, trying fallback: " + fb);
+            ok = SendJsonPost(fb, path, payload, "[ONLINE-FB]", header);
+        }
+        return;
+    }
+
+    // Not registered yet — register first
+    {
+        nlohmann::json payload;
+        payload["instance_id"] = Config.ServerUniqueId.empty() ? "server-unknown" : Config.ServerUniqueId;
+        payload["region"]      = Config.ServerRegion;
+        payload["version"]     = "0.7.0";
+        payload["endpoint"]    = { {"host", "0.0.0.0"}, {"port", Config.ExternalPort} };
+        payload["capacity"]    = { {"max_players", 10} };
+        payload["metadata"]    = { {"mode", std::string(Config.FullModePath.begin(), Config.FullModePath.end())},
+                                   {"map",  std::string(Config.MapName.begin(), Config.MapName.end())} };
+
+        std::string header = "Authorization: Bearer " + RegistrationToken;
+
+        bool ok = SendJsonPost(backend, "/v1/game-servers", payload, "[REGISTER]", header);
+        // Simple fallback is handled inside SendJsonPost now — we can't parse response there.
+        // For MVP: just try primary, then fallback.
+        if (!ok)
+        {
+            std::string fb = (backend == BACKEND_PRIMARY) ? BACKEND_FALLBACK : BACKEND_PRIMARY;
+            ok = SendJsonPost(fb, "/v1/game-servers", payload, "[REGISTER-FB]", header);
+        }
+        // Note: full JSON response parsing for server_id / server_token
+        // will be added once the endpoint is confirmed working.
+    }
 }
 
 bool SendRoomLifecycleEvent(const std::string &backend, const std::string &lifecycleAction)
@@ -238,11 +301,8 @@ void StartHeartbeatThread()
             {
                 int pc = GetCurrentPlayerCount();
                 std::cout << "[HEARTBEAT] PlayerCount = " << pc << std::endl;
-
-                if (!OnlineBackendAddress.empty())
-                {
-                    SendServerStatus(OnlineBackendAddress);
-                }
+                // HTTP heartbeat is now handled by ToolBox registration worker.
+                // DLL only reports state via the named pipe (server_status callback).
             }
             else
             {

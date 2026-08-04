@@ -19,6 +19,11 @@ struct ServerConfig
 // Central server ip
 extern std::string OnlineBackendAddress;
 
+// Server registration
+extern std::string RegistrationToken;
+extern std::string g_ServerId;
+extern std::string g_ServerToken;
+
 // Room heartbeat credentials from the desktop browser/match server
 extern std::string HostRoomId;
 extern std::string HostToken;

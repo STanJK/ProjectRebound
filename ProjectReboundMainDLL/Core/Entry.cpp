@@ -174,6 +174,41 @@ void MainThread()
 
             StartServer();
 
+            // Create named-pipe server so ToolBox can read server_status.
+            // Must run after StartServer() because LoadConfig() is called inside it.
+            if (!MatchPipeName.empty())
+            {
+                auto framework = std::make_unique<ExternalCommandPipe>();
+                framework->SetPipeName(MatchPipeName);
+                framework->SetLogCallback([](const std::string& msg) { ServerLog(msg); });
+                framework->SetServerStatusCallback([]() -> nlohmann::json {
+                    int pc = GetCurrentPlayerCount();
+                    std::string round = "Unknown";
+                    UWorld* world = UWorld::GetWorld();
+                    if (world && world->AuthorityGameMode && world->AuthorityGameMode->GameState)
+                    {
+                        APBGameState* gs = static_cast<APBGameState*>(world->AuthorityGameMode->GameState);
+                        round = gs->RoundState.ToString();
+                    }
+                    return nlohmann::json{
+                        {"state", "READY"},
+                        {"player_count", pc},
+                        {"round_state", round}
+                    };
+                });
+
+                if (framework->Start())
+                {
+                    std::lock_guard<std::mutex> lock(g_CmdFrameworkMutex);
+                    g_CmdFramework = framework.release();
+                    ServerLog("[SERVER] Command pipe started.");
+                }
+                else
+                {
+                    ServerLog("[SERVER] Command pipe FAILED to start.");
+                }
+            }
+
             // Heartbeat thread (game + backend)
             StartHeartbeatThread();
         }
