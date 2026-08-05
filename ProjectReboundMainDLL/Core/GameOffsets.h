@@ -56,6 +56,9 @@ namespace GameOffsets
         constexpr uintptr_t IsServer = 0x3326C60;
         constexpr uintptr_t IsStandalone = 0x3326CE0;
         constexpr uintptr_t ClientDeathCrash = 0x16ABE10;
+        constexpr uintptr_t FixEquipErrorCode = 0x16DD080;
+        constexpr uintptr_t FixSkinErrorCode = 0x16DCEC0;
+        constexpr uintptr_t FixBadgeOrnamentErrorCode = 0x16DCD80;
     }
 
     namespace ReturnAddress

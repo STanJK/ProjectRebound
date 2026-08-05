@@ -27,6 +27,39 @@ SafetyHookInline ActorNeedsLoad;
 SafetyHookInline IsDedicatedServerHook;
 SafetyHookInline IsServerHook;
 SafetyHookInline IsStandaloneHook;
+SafetyHookInline FixEquipErrorHook;
+SafetyHookInline FixSkinErrorHook;
+SafetyHookInline FixBadgeOrnamentErrorHook;
+
+// ======================================================
+//  Equip error resolver hooks
+// ======================================================
+//
+// Intercept the terminal error resolvers before ProcessEvent.
+// Known success codes (0, 200, 9001-9003) pass through;
+// unrecognized values (incl. the async task's default 404)
+// are forced to 0 (NoError).
+
+void __fastcall FixEquipErrorHookFn(__int64 a1, int a2, __int64 a3, __int64 a4, int a5)
+{
+    if (a2 != 0 && a2 != 200 && a2 != 9001 && a2 != 9002 && a2 != 9003)
+        a2 = 0;
+    FixEquipErrorHook.call<void>(a1, a2, a3, a4, a5);
+}
+
+void __fastcall FixSkinErrorHookFn(__int64 a1, int a2, __int64 a3, __int64 a4, __int64 a5)
+{
+    if (a2 != 0 && a2 != 200 && a2 != 9001 && a2 != 9002 && a2 != 9003)
+        a2 = 0;
+    FixSkinErrorHook.call<void>(a1, a2, a3, a4, a5);
+}
+
+void __fastcall FixBadgeOrnamentErrorHookFn(__int64 a1, int a2, __int64 a3, __int64 a4, int a5)
+{
+    if (a2 != 0 && a2 != 200 && a2 != 9001 && a2 != 9002 && a2 != 9003)
+        a2 = 0;
+    FixBadgeOrnamentErrorHook.call<void>(a1, a2, a3, a4, a5);
+}
 
 // ======================================================
 //  Inline-hook helpers
@@ -193,6 +226,9 @@ void InitClientHook()
     const FInlineHookSpec ClientHooks[] = {
         { "ProcessEventClient", &ProcessEventClient, GameOffsets::Hook::ProcessEvent, reinterpret_cast<void*>(ProcessEventHookClient) },
         { "ClientDeathCrash", &ClientDeathCrash, GameOffsets::Hook::ClientDeathCrash, reinterpret_cast<void*>(ClientDeathCrashHook) },
+        { "FixEquipError",       &FixEquipErrorHook,          GameOffsets::Hook::FixEquipErrorCode,          reinterpret_cast<void*>(FixEquipErrorHookFn) },
+        { "FixSkinError",        &FixSkinErrorHook,           GameOffsets::Hook::FixSkinErrorCode,           reinterpret_cast<void*>(FixSkinErrorHookFn) },
+        { "FixBadgeOrnament",    &FixBadgeOrnamentErrorHook,  GameOffsets::Hook::FixBadgeOrnamentErrorCode,  reinterpret_cast<void*>(FixBadgeOrnamentErrorHookFn) },
     };
 
     InstallInlineHooks(ClientHooks);
