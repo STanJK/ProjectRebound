@@ -153,6 +153,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Core\Entry.cpp" />
+    <ClCompile Include="Core\IntegrityProof.cpp" />
     <ClCompile Include="Config\Config.cpp" />
     <ClCompile Include="Logging\LogManager.cpp" />
     <ClCompile Include="Hooking\HookCore.cpp" />

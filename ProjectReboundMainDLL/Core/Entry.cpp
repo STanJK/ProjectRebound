@@ -25,6 +25,7 @@
 #include "../Client/AutoConnect.h"
 #include "../API/ExternalCommandPipe.h"
 #include "../API/APIInternal.h"
+#include "IntegrityProof.h"
 #include "../Server/PlayerNaming.h"
 
 using namespace SDK;
@@ -195,6 +196,15 @@ void MainThread()
                         {"player_count", pc},
                         {"round_state", round}
                     };
+                });
+                // Integrity challenge: ToolBox sends nonce, DLL proves it has the PEM.
+                framework->SetDebugCallback([](const nlohmann::json& args) -> nlohmann::json {
+                    if (args.contains("integrity_nonce") && args["integrity_nonce"].is_string())
+                    {
+                        std::string nonce = args["integrity_nonce"].get<std::string>();
+                        return nlohmann::json{{"proof", IntegrityProof::Compute(nonce)}};
+                    }
+                    return nlohmann::json{{"error", "unknown debug command"}};
                 });
 
                 if (framework->Start())
