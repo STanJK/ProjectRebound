@@ -10,6 +10,7 @@
 #include "../Server/LateJoin.h"
 #include "../Server/RoundManager.h"
 #include "../Server/SideMountFixServer.h"
+#include "../Server/B5WeaponConfig.h"
 #include "../SDK/Engine_parameters.hpp"
 
 extern uintptr_t BaseAddress;
@@ -21,8 +22,15 @@ using namespace SDK;
 //  ProcessEventHook — server-side dispatch
 // ======================================================
 
+extern thread_local bool g_InNativeCall;
+
 void ProcessEventHook(UObject *Object, UFunction *Function, void *Parms)
 {
+    // B.5: skip hook during native calls (FName construction via Conv_StringToName,
+    // converter calls, etc.) to prevent ProcessEvent reentry
+    if (B5WeaponConfig::g_InB5NativeCall || g_InNativeCall)
+        return ProcessEvent.call(Object, Function, Parms);
+
     const FCachedProcessEventInfo& EventInfo = GetProcessEventInfo(Function);
 
     if (EventInfo.ServerKind == EServerProcessEventKind::MatchHasEnded)
