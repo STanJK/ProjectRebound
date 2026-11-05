@@ -13,6 +13,9 @@
 #include "../Server/RoundManager.h"
 #include "../Server/PlayerNaming.h"
 #include "../Server/PvECamera.h"
+#include "../Server/LoadoutSync.h"
+#include "../Server/B5WeaponConfig.h"
+#include "../Server/CharCosmetics.h"
 
 #include <Windows.h>
 
@@ -165,6 +168,10 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
 
     UserNameFix_DrainPending();
     PVECamFix_Tick(NetDriver, DeltaTime);
+    LoadoutSync::DrainPending();
+    LoadoutSync::PruneStaleCaches();
+    B5WeaponConfig::DeferredReapplyTick();
+    CharCosmetics::DeferredReapplyTick();
 
     if (IsServerShutdownRequested())
     {
@@ -310,6 +317,7 @@ void *PostLogin(AGameMode *GameMode, APBPlayerController *PC)
     ServerDebugLog("[POST-LOGIN] Player #" + std::to_string(NumPlayersJoined) + " connected");
 
     UserNameFix_OnPostLogin(GameMode, PC);
+    LoadoutSync::OnPlayerJoined(GameMode, PC);
 
     // LateJoin detection
     if (gLateJoinManager && gLateJoinManager->OnPostLogin(GameMode, PC))

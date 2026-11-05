@@ -27,6 +27,7 @@
 #include "../API/APIInternal.h"
 #include "IntegrityProof.h"
 #include "../Server/PlayerNaming.h"
+#include "../Server/B5WeaponConfig.h"
 
 using namespace SDK;
 
@@ -172,6 +173,12 @@ void MainThread()
                 nullptr // ReportRoomStarted callback — can be wired later
             );
             ServerLog("[SERVER] LateJoinManager initialized.");
+
+            // B.5: Initialize weapon config injection
+            if (B5WeaponConfig::Init(BaseAddress))
+                ServerLog("[SERVER] B5WeaponConfig initialized.");
+            else
+                ServerLog("[SERVER] B5WeaponConfig init FAILED — weapon config injection disabled.");
 
             StartServer();
 

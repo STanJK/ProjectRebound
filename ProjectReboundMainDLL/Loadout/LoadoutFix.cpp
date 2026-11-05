@@ -21,8 +21,10 @@ using namespace SDK;
 // but Native broadcasts OnEquipCharacterSlotDelegate(UnknowError=4) and the
 // internal listener skips UPBShowRoomManager::SpawnInventory().
 //
-// We zero ErrorCode so the BP callbacks show "已装备", then directly call
-// SpawnInventory(CharacterID, ItemID) to refresh the 3D display actor.
+// We zero ONLY UnknowError (the spurious one) so the BP callbacks show "已装备",
+// then directly call SpawnInventory() to refresh the 3D display actor.
+// Real errors (QuotaNotEnough, IsLocked, …) are left intact so the game shows
+// the correct "insufficient quota" / "locked" toast.
 
 static bool  s_PendingSpawn = false;
 static FName s_PendingCharID;
@@ -34,29 +36,41 @@ void HandleEquipErrorSwallow(UObject* Object, UFunction* Function, void* Parms,
     if (funcName.find("OnEquipCharacterSlotComplete") != std::string::npos)
     {
         auto* P = static_cast<Params::PBDetailedWeaponDataWidget_OnEquipCharacterSlotComplete*>(Parms);
-        if ((int)P->ErrorCode != 0)
+        if ((int)P->ErrorCode == (int)EPBEquipErrorCode::UnknowError)
         {
             ClientDebugLog("[LOADOUT-FIX] OnEquipSlotComplete"
                       + std::string("  Item=") + P->InItemID.ToString()
                       + "  Char=" + P->InCharacterID.ToString()
                       + "  Slot=" + std::to_string((int)P->InCharacterSlotType)
-                      + "  Err " + std::to_string((int)P->ErrorCode) + " -> 0");
+                      + "  Err=UnknowError -> 0 (metaserver saved OK)");
             P->ErrorCode = EPBEquipErrorCode::NoError;
 
             s_PendingSpawn = true;
             s_PendingCharID = P->InCharacterID;
             s_PendingItemID = P->InItemID;
         }
+        else if ((int)P->ErrorCode != (int)EPBEquipErrorCode::NoError)
+        {
+            ClientDebugLog("[LOADOUT-FIX] OnEquipSlotComplete"
+                      + std::string("  Item=") + P->InItemID.ToString()
+                      + "  Err=" + std::to_string((int)P->ErrorCode) + " (passed through)");
+        }
     }
     else if (funcName.find("K2_OnEquipComplete") != std::string::npos)
     {
         auto* P = static_cast<Params::PBCustomizeWidget_K2_OnEquipComplete*>(Parms);
-        if ((int)P->ErrorCode != 0)
+        if ((int)P->ErrorCode == (int)EPBEquipErrorCode::UnknowError)
         {
             ClientDebugLog("[LOADOUT-FIX] K2_OnEquipComplete"
                       + std::string("  Item=") + P->InItemID.ToString()
-                      + "  Err " + std::to_string((int)P->ErrorCode) + " -> 0");
+                      + "  Err=UnknowError -> 0 (metaserver saved OK)");
             P->ErrorCode = EPBEquipErrorCode::NoError;
+        }
+        else if ((int)P->ErrorCode != (int)EPBEquipErrorCode::NoError)
+        {
+            ClientDebugLog("[LOADOUT-FIX] K2_OnEquipComplete"
+                      + std::string("  Item=") + P->InItemID.ToString()
+                      + "  Err=" + std::to_string((int)P->ErrorCode) + " (passed through)");
         }
     }
 }
