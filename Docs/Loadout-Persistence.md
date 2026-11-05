@@ -20,7 +20,6 @@ and RVAs below belong to that build and are used as constants (no signature scan
 | `Server/B5WeaponConfig.cpp/.h` | converts a weapon's DataTable row to `FPBWeaponNetworkConfig`, patches the overrides in, writes it into the actor and forces replication |
 | `Server/CharCosmetics.cpp/.h` | writes `APBCharacter::CharacterSkinConfig` and applies it |
 | `Logging/FileLog.h` | `LogF()` — one bounded, truncating log helper (`_vsnprintf_s`) |
-| `Loadout/LoadoutFix.cpp` (existing) | client-side equip-widget fix; only its error handling and logging changed |
 
 ## Flow
 
@@ -125,9 +124,10 @@ respawn, and a single-sweep rule would throw away a loadout that is still needed
 
 ## Configuration
 
-The metaserver address is the literal `127.0.0.1:8000` in `Server/LoadoutSync.cpp` and
-in `Loadout/LoadoutFix.cpp` (two call sites). Making it configurable is the obvious next
-step; it is left hard-coded here to keep this change reviewable.
+The metaserver address is the literal `127.0.0.1:8000` in `Server/LoadoutSync.cpp` (the
+client-side fetch in `Loadout/LoadoutFix.cpp` uses the same address and is unchanged here).
+Making it configurable is the obvious next step; it is left hard-coded to keep this change
+reviewable.
 
 ## Known limitations
 
