@@ -73,7 +73,7 @@ static void ApplyOverridesToConfig(void* config, const std::string& playerId, st
                 const FPartOverride& ov = ovIt->second;
                 if (ov.PartIdFName)  *reinterpret_cast<std::uint64_t*>(elem + 0x00) = ov.PartIdFName; // WeaponPartID (attachment)
                 // An ornament id is one of two DIFFERENT things, selected by its `type`
-                // (see NEXT_SESSION_PROMPT.md §9):
+                // (see Docs/Loadout-Persistence.md):
                 //   PartOri / absent ("PT*")  -> painting theme  -> WeaponPartSkinPaintingID (+0x18)
                 //   anything else (SMGTiger*) -> part skin mesh  -> WeaponPartSkinID (+0x08)
                 // LoadoutSync routes the id into the matching slot; never write one into both.

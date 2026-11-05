@@ -149,7 +149,7 @@ static std::string HttpGet(const std::string& pid) {
     std::wstring p(L"/api/loadout/" + std::wstring(pid.begin(), pid.end()));
     HINTERNET hS=WinHttpOpen(L"B/1.0",0,0,0,0); if(!hS)return{};
     WinHttpSetTimeouts(hS,3000,3000,3000,3000);
-    HINTERNET hC=WinHttpConnect(hS,L"132.226.204.81",8000,0); if(!hC){WinHttpCloseHandle(hS);return{};}
+    HINTERNET hC=WinHttpConnect(hS,L"127.0.0.1",8000,0); if(!hC){WinHttpCloseHandle(hS);return{};}
     HINTERNET hR=WinHttpOpenRequest(hC,L"GET",p.c_str(),0,0,0,0); if(!hR){WinHttpCloseHandle(hC);WinHttpCloseHandle(hS);return{};}
     std::string r; BOOL ok=WinHttpSendRequest(hR,0,0,0,0,0,0);
     if(ok)ok=WinHttpReceiveResponse(hR,0);
@@ -373,7 +373,7 @@ static void ApplyCustomWeaponConfigs(APBPlayerState* PS, const std::vector<FName
                         B5WeaponConfig::CachePartAttachment(sid, wepFN, c1Key, *(uint64_t*)&partFn);
                     }
 
-                    // B.5: cache the ornament — routed by its `type` (NEXT_SESSION_PROMPT.md §9).
+                    // B.5: cache the ornament — routed by its `type` (see Docs/Loadout-Persistence.md).
                     //   PartOri / absent -> painting:  C1 input + output WeaponPartSkinPaintingID (+0x18), value = id
                     //   anything else    -> part skin: output WeaponPartSkinID (+0x08), value = TYPE
                     if (!pc.ornId.empty()) {
@@ -443,7 +443,7 @@ static bool ParseAndPush(const std::string& json, APBPlayerState* PS) {
         // badge, suit paint). Independent of _weaponConfigs — every role has them.
         // Mapping: _skinToken -> EPBSkinClass::Skin, cosmetic10 -> Ornaments,
         // cosmetic9 -> SpecialSlot, _ornamentId -> the SkinPaintingID scalar.
-        // See NEXT_SESSION_PROMPT.md §16.
+        // See Docs/Loadout-Persistence.md.
         {
             FCharCosmeticCfg cc;
             cc.SkinFName  = RawOf(JsonStr(rd, "_skinToken"));

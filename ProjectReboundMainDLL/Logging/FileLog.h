@@ -4,8 +4,8 @@
 // server + client processes.
 //
 // The path is derived from %USERPROFILE% rather than hard-coded, and if the
-// primary file cannot be opened (a viewer may hold it — see
-// NEXT_SESSION_PROMPT.md §3) the line goes to %TEMP% instead of being lost.
+// primary file cannot be opened (a viewer such as `tail -f` may hold it) the
+// line goes to %TEMP% instead of being lost.
 
 #pragma once
 #include <cstdio>

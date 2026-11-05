@@ -13,7 +13,7 @@
 // Net+RepNotify FPBCharacterNetworkConfig (0x28), then applied with
 // OnRep_CharacterSkinConfig() + ForceNetUpdate() so the change reaches clients.
 //
-// See NEXT_SESSION_PROMPT.md §16 for the evidence trail behind the class mapping.
+// See Docs/Loadout-Persistence.md for the evidence behind the class mapping.
 
 #pragma once
 
