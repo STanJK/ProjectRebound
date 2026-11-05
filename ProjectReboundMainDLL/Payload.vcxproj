@@ -171,6 +171,7 @@
     <ClCompile Include="Server\SideMountFixServer.cpp" />
     <ClCompile Include="Server\LoadoutSync.cpp" />
     <ClCompile Include="Server\B5WeaponConfig.cpp" />
+    <ClCompile Include="Server\CharCosmetics.cpp" />
     <ClCompile Include="Client\AutoConnect.cpp" />
     <ClCompile Include="Client\SideMountFixClient.cpp" />
     <ClCompile Include="Client\UIShake.cpp" />

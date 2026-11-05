@@ -15,6 +15,7 @@
 #include "../Server/PvECamera.h"
 #include "../Server/LoadoutSync.h"
 #include "../Server/B5WeaponConfig.h"
+#include "../Server/CharCosmetics.h"
 
 #include <Windows.h>
 
@@ -171,6 +172,7 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
     LoadoutSync::SelfTestDrain();
     LoadoutSync::DrainPending();
     B5WeaponConfig::DeferredReapplyTick();
+    CharCosmetics::DeferredReapplyTick();
 
     if (IsServerShutdownRequested())
     {

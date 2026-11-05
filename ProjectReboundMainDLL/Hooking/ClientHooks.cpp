@@ -220,6 +220,33 @@ void ProcessEventHookClient(UObject *Object, UFunction *Function, void *Parms)
         }
     }
 
+    // --- B.5: OnRep_CharacterSkinConfig — verify character cosmetics arrived ---
+    if (EventInfo.FullName.find("OnRep_CharacterSkinConfig") != std::string::npos)
+    {
+        static int s_OnRepCharCount = 0;
+        if (Object && Object->IsA(APBCharacter::StaticClass()) && s_OnRepCharCount < 60)
+        {
+            s_OnRepCharCount++;
+            unsigned char* chr = (unsigned char*)Object;
+            // APBCharacter::CharacterSkinConfig (+0x698): SkinClassArray, SkinIDArray, SkinPaintingID
+            void*    clsData  = *(void**)(chr + 0x698);
+            int      clsNum   = *(int*)(chr + 0x6A0);
+            void*    idData   = *(void**)(chr + 0x6A8);
+            int      idNum    = *(int*)(chr + 0x6B0);
+            uint32_t paintCI  = *(uint32_t*)(chr + 0x6B8);
+            char buf[256];
+            sprintf_s(buf, "[CLIENT][CHAR-SKIN] chr=%p classes=%d ids=%d paint=0x%04X",
+                Object, clsNum, idNum, paintCI);
+            WriteLog(buf);
+            for (int i = 0; i < clsNum && i < 8; ++i) {
+                uint8_t  cls  = clsData ? *(uint8_t*)((unsigned char*)clsData + i) : 0xFF;
+                uint32_t idCI = (idData && i < idNum) ? *(uint32_t*)((unsigned char*)idData + 8 * i) : 0;
+                sprintf_s(buf, "[CLIENT][CHAR-SKIN]   [%d] class=%d id=0x%04X", i, (int)cls, idCI);
+                WriteLog(buf);
+            }
+        }
+    }
+
     // B.5: log the nested ProcessEvents that OnRep_PartNetworkConfig triggers.
     if (s_TraceOnRep && s_PEDepth > 0)
     {

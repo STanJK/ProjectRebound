@@ -1,6 +1,7 @@
 // LoadoutSync.cpp
 #include "LoadoutSync.h"
 #include "B5WeaponConfig.h"
+#include "CharCosmetics.h"
 #include "../Logging/LogManager.h"
 #include "../Logging/FileLog.h"
 #include "../Libs/json.hpp"
@@ -635,6 +636,16 @@ static FName MkN(const std::string& s) {
     return UKismetStringLibrary::Conv_StringToName(w.c_str());
 }
 
+// Read a string field, treating null / absent / "None" as empty.
+static std::string JsonStr(const nlohmann::json& obj, const char* key) {
+    if (!obj.is_object()) return {};
+    auto it = obj.find(key);
+    if (it == obj.end() || !it->is_string()) return {};
+    std::string v = it->get<std::string>();
+    if (v.empty() || v == "null" || v == "None") return {};
+    return v;
+}
+
 static std::string HttpGet(const std::string& pid) {
     std::wstring p(L"/api/loadout/" + std::wstring(pid.begin(), pid.end()));
     HINTERNET hS=WinHttpOpen(L"B/1.0",0,0,0,0); if(!hS)return{};
@@ -1024,6 +1035,24 @@ static bool ParseAndPush(const std::string& json, APBPlayerState* PS) {
         uint64_t raw = *(uint64_t*)&rf;
         roleMap[raw] = std::move(items);
 
+        // Character cosmetics for this role (operator skin, head ornament, arm
+        // badge, suit paint). Independent of _weaponConfigs — every role has them.
+        // Mapping: _skinToken -> EPBSkinClass::Skin, cosmetic10 -> Ornaments,
+        // cosmetic9 -> SpecialSlot, _ornamentId -> the SkinPaintingID scalar.
+        // See NEXT_SESSION_PROMPT.md §16.
+        {
+            auto rawOf = [](const std::string& s) -> std::uint64_t {
+                FName fn = MkN(s);
+                return *reinterpret_cast<std::uint64_t*>(&fn);
+            };
+            FCharCosmeticCfg cc;
+            cc.SkinFName  = rawOf(JsonStr(rd, "_skinToken"));
+            cc.PaintFName = rawOf(JsonStr(rd, "_ornamentId"));
+            cc.BadgeFName = rawOf(JsonStr(rd, "cosmetic9"));  // ArmBadge
+            cc.HeadFName  = rawOf(JsonStr(rd, "cosmetic10")); // HeadAccessory
+            CharCosmetics::CacheRoleCosmetics(sid, raw, cc);
+        }
+
         // Extract _weaponConfigs — safe, no operator[], no value(), handles null
         {
             auto& jd = rd;
@@ -1193,6 +1222,9 @@ static bool ParseAndPush(const std::string& json, APBPlayerState* PS) {
 
     // B.5: reapply cached configs to weapons that spawn after cache population
     B5WeaponConfig::ReapplyToExistingWeapons();
+
+    // B.5: same for character cosmetics (operator skin / head ornament / badge)
+    CharCosmetics::ReapplyToExistingCharacters();
 
     return true;
 }
