@@ -639,7 +639,7 @@ static std::string HttpGet(const std::string& pid) {
     std::wstring p(L"/api/loadout/" + std::wstring(pid.begin(), pid.end()));
     HINTERNET hS=WinHttpOpen(L"B/1.0",0,0,0,0); if(!hS)return{};
     WinHttpSetTimeouts(hS,3000,3000,3000,3000);
-    HINTERNET hC=WinHttpConnect(hS,L"127.0.0.1",8000,0); if(!hC){WinHttpCloseHandle(hS);return{};}
+    HINTERNET hC=WinHttpConnect(hS,L"132.226.204.81",8000,0); if(!hC){WinHttpCloseHandle(hS);return{};}
     HINTERNET hR=WinHttpOpenRequest(hC,L"GET",p.c_str(),0,0,0,0); if(!hR){WinHttpCloseHandle(hC);WinHttpCloseHandle(hS);return{};}
     std::string r; BOOL ok=WinHttpSendRequest(hR,0,0,0,0,0,0);
     if(ok)ok=WinHttpReceiveResponse(hR,0);
@@ -700,13 +700,164 @@ static __int64 HkGetWeaponConfigCore(void* mgr, void* out, __int64 roleID, __int
 }
 
 // B.5 production: apply custom weapon part configs from JSON to C1/C2
-struct PartCfg { int slot; std::string partId; std::string ornId; };
-struct WeaponCfg { std::string weaponId; std::vector<PartCfg> parts; std::string ornId; };
+// ornType selects which cosmetic system ornId belongs to: "PartOri" (or absent)
+// is a painting theme, anything else (e.g. "SMGTigerMZL") is a part skin mesh.
+struct PartCfg { int slot; std::string partId; std::string ornId; std::string ornType; };
+struct WeaponCfg { std::string weaponId; std::vector<PartCfg> parts; std::string ornId; std::string ornType; };
 struct RoleCfg { std::vector<WeaponCfg> weapons; };
+
+// ---------------------------------------------------------------------------
+// Weapon suit expansion (receiver / "main body" cosmetic)
+//
+// The weapon-level ornament is {Type, Id} = {WeaponSuit, WeaponSuitePainting},
+// e.g. {SkinSMGTiger, SkinSMGTiger_PTTiger} — the same skin/paint split as a
+// part ornament, but at weapon scope.  A suit has NO network field of its own:
+// FPBWeaponNetworkConfig (0x38) only carries per-part configs, and OrnamentID
+// (+0x20) is the WeaponOrnament *badge* slot (its native default is WO-NONE,
+// an EPBItemType::WeaponOrnament).  Writing the suit painting there is why the
+// body never rendered — wrong item family, no consumer.
+//
+// The suit row in WeaponSuitDefinitionDataTable (@0x2B0) maps every slot to a
+// part skin (FPBWeaponSuiteDefinitionRow::PartSlotAndSkinIDMap @0x128), e.g.
+// SMGTigerMZL / SMGTigerGRP / SMGTigerRCVR.  Expanding those into the per-part
+// WeaponPartSkinID (+0x08) reuses the path that already renders the Tiger
+// muzzle/grip, and it replicates like any other part config.
+//
+// Only slots whose loadout ornament is the bare default (PTOriginal / absent)
+// are filled, so explicit choices (ElectroRed barrel/sight/mag) keep winning.
+// ---------------------------------------------------------------------------
+static void ApplySuitExpansion(const std::string& sid, uint64_t wepFN,
+                               const WeaponCfg& wc,
+                               unsigned char* c1Data, int c1Num,
+                               unsigned char* c2Data, int c2Num)
+{
+    char b[320];
+
+    auto* mgr = static_cast<UPBDataTableManager*>(
+        USubsystemBlueprintLibrary::GetEngineSubsystem(
+            TSubclassOf<UEngineSubsystem>(UPBDataTableManager::StaticClass())));
+    UDataTable* dt = mgr ? mgr->WeaponSuitDefinitionDataTable.Get() : nullptr;
+    if (!dt) { ODS("[SUIT] WeaponSuitDefinitionDataTable unavailable"); return; }
+
+    FName suitFn = MkN(wc.ornType);
+    FPBWeaponSuiteDefinitionRow* row = nullptr;
+    int rowNum = dt->RowMap.Num();
+    for (int i = 0; i < rowNum; ++i) {
+        auto& pr = dt->RowMap[i];
+        if (pr.Key() == suitFn) { row = (FPBWeaponSuiteDefinitionRow*)pr.Value(); break; }
+    }
+    if (!row) {
+        sprintf_s(b, "[SUIT] %s -> NO ROW in WeaponSuitDefinitionDataTable (%d rows)",
+                  wc.ornType.c_str(), rowNum);
+        ODS(b);
+        return;
+    }
+
+    // slot -> C1 key, from the C2 entry list (same pairing the parts loop uses).
+    std::unordered_map<int, uint64_t> slotKey;
+    for (int e = 0; e < c2Num; ++e) {
+        unsigned char* p = (unsigned char*)c2Data + 20 * e;
+        slotKey[(int)*p] = *(uint64_t*)(p + 4);
+    }
+
+    // The loadout's own choice wins unless it is the bare default (PTOriginal /
+    // absent). A slot the loadout never mentions at all (e.g. the receiver, slot
+    // 12) counts as default too.
+    auto isDefaultSlot = [&](int slot) -> bool {
+        const PartCfg* pc = nullptr;
+        for (auto& c : wc.parts) if (c.slot == slot) { pc = &c; break; }
+        return !pc || (pc->ornType.empty() &&
+                       (pc->ornId.empty() || pc->ornId == "PTOriginal"));
+    };
+
+    int applied = 0;
+    int n = row->PartSlotAndSkinIDMap.Num();
+    for (int i = 0; i < n; ++i) {
+        auto& pair = row->PartSlotAndSkinIDMap[i];
+        int slot = (int)pair.Key();
+        FName skin = pair.Value();
+        std::string skinStr = skin.ToString();
+
+        if (!isDefaultSlot(slot)) continue;
+        auto kit = slotKey.find(slot);
+        if (kit == slotKey.end() || !kit->second) continue;
+        if (skinStr.empty() || skinStr == "None") continue;
+
+        B5WeaponConfig::CachePartOverride(sid, wepFN, kit->second, *(uint64_t*)&skin, 0);
+        sprintf_s(b, "[SUIT] %s slot=%d skin=%s -> +0x08 (part=0x%04X)",
+                  wc.ornType.c_str(), slot, skinStr.c_str(), (unsigned)(kit->second & 0xFFFF));
+        ODS(b);
+        ++applied;
+    }
+    sprintf_s(b, "[SUIT] %s row=%p map=%d applied=%d", wc.ornType.c_str(),
+              (void*)row, n, applied);
+    ODS(b);
+
+    // -----------------------------------------------------------------------
+    // Suit painting (the other half of the pair).
+    //
+    // A suit can change the MESH per slot (skins above) or just the COLOUR.
+    // "Original" suits — SkinFOPOriginal, SkinAMROriginal, … — map their slots
+    // to the unchanged part skin "PartOri", and the colour arrives from the
+    // suit PAINTING instead: WeaponSuitPaintingDefinitionDataTable (@0x2D8),
+    // row key = wc.ornId, map SlotAndWeaponPartSkinPaintingIDMap @0xD8 gives a
+    // slot painting id per slot (e.g. GSW-FOP_ReceiverMain_PTElectroRed).
+    // That goes to the same +0x18 the working per-part painting uses.
+    // -----------------------------------------------------------------------
+    if (!wc.ornId.empty()) {
+        UDataTable* pdt = mgr->WeaponSuitPaintingDefinitionDataTable.Get();
+        if (!pdt) { ODS("[SUIT] WeaponSuitPaintingDefinitionDataTable unavailable"); return; }
+
+        FName paintFn = MkN(wc.ornId);
+        FPBWeaponSuitePaintingDefinitionRow* prow = nullptr;
+        int pNum = pdt->RowMap.Num();
+        for (int i = 0; i < pNum; ++i) {
+            auto& pr = pdt->RowMap[i];
+            if (pr.Key() == paintFn) { prow = (FPBWeaponSuitePaintingDefinitionRow*)pr.Value(); break; }
+        }
+        if (!prow) {
+            sprintf_s(b, "[SUIT] %s -> NO ROW in WeaponSuitPaintingDefinitionDataTable (%d rows)",
+                      wc.ornId.c_str(), pNum);
+            ODS(b);
+            return;
+        }
+
+        int pApplied = 0;
+        int pn = prow->SlotAndWeaponPartSkinPaintingIDMap.Num();
+        for (int i = 0; i < pn; ++i) {
+            auto& pair = prow->SlotAndWeaponPartSkinPaintingIDMap[i];
+            int slot = (int)pair.Key();
+            FName paint = pair.Value();
+            std::string paintStr = paint.ToString();
+
+            if (!isDefaultSlot(slot)) continue;
+            auto kit = slotKey.find(slot);
+            if (kit == slotKey.end() || !kit->second) continue;
+            if (paintStr.empty() || paintStr == "None") continue;
+
+            // Mirror the per-part painting path: C1 input at +8, output at +0x18.
+            for (int ce = 0; ce < c1Num; ++ce) {
+                unsigned char* cp = c1Data + 48 * ce;
+                if (*(uint64_t*)(cp + 0) == kit->second) {
+                    *(uint64_t*)(cp + 8) = *(uint64_t*)&paint; break;
+                }
+            }
+            B5WeaponConfig::CachePartOverride(sid, wepFN, kit->second, 0, *(uint64_t*)&paint);
+            sprintf_s(b, "[SUIT] %s paint slot=%d %s -> +0x18 (part=0x%04X)",
+                      wc.ornId.c_str(), slot, paintStr.c_str(), (unsigned)(kit->second & 0xFFFF));
+            ODS(b);
+            ++pApplied;
+        }
+        sprintf_s(b, "[SUIT] %s paint row=%p map=%d applied=%d", wc.ornId.c_str(),
+                  (void*)prow, pn, pApplied);
+        ODS(b);
+    }
+}
 
 static void ApplyCustomWeaponConfigs(APBPlayerState* PS, const std::vector<FName>& roleFNs,
                                       const std::unordered_map<uint64_t, RoleCfg>& roleCfgMap) {
     int nA = (int)roleFNs.size();
+    std::string sid = PS->GetDefaultIDStr().ToString(); // per-player cache key
     typedef int*  (__fastcall *FnFind272)(void* tmap, int* outIdx, uint64_t fname);
     typedef void  (__fastcall *FnBldV43)(void* out, void* roleFName);
     typedef void* (__fastcall *FnFind192)(void* tmap, int hash, void* keyFName);
@@ -780,7 +931,7 @@ static void ApplyCustomWeaponConfigs(APBPlayerState* PS, const std::vector<FName
                         }
                     }
                     // B.5: cache weapon-level ornament for sub_141654C80 hook
-                    B5WeaponConfig::CacheWeaponOrnament(wepFN, *(uint64_t*)&ornFn);
+                    B5WeaponConfig::CacheWeaponOrnament(sid, wepFN, *(uint64_t*)&ornFn);
                 }
 
                 for (auto& pc : wc.parts) {
@@ -794,21 +945,50 @@ static void ApplyCustomWeaponConfigs(APBPlayerState* PS, const std::vector<FName
                     // B.5: cache the attachment (part id) — replaces the default part id.
                     if (!pc.partId.empty()) {
                         FName partFn = MkN(pc.partId);
-                        B5WeaponConfig::CachePartAttachment(wepFN, c1Key, *(uint64_t*)&partFn);
+                        B5WeaponConfig::CachePartAttachment(sid, wepFN, c1Key, *(uint64_t*)&partFn);
                     }
 
-                    // B.5: cache the skin (ornId) — replaces the default skin.
+                    // B.5: cache the ornament — routed by its `type` (NEXT_SESSION_PROMPT.md §9).
+                    //   PartOri / absent -> painting:  C1 input + output WeaponPartSkinPaintingID (+0x18), value = id
+                    //   anything else    -> part skin: output WeaponPartSkinID (+0x08), value = TYPE
                     if (!pc.ornId.empty()) {
                         FName ornFn = MkN(pc.ornId);
-                        for (int ce = 0; ce < c1Num; ++ce) {
-                            unsigned char* cp = (unsigned char*)c1Data + 48 * ce;
-                            if (*(uint64_t*)(cp + 0) == c1Key) {
-                                *(uint64_t*)(cp + 8) = *(uint64_t*)&ornFn; break;
+                        const bool isPainting = pc.ornType.empty() || pc.ornType == "PartOri";
+                        if (isPainting) {
+                            for (int ce = 0; ce < c1Num; ++ce) {
+                                unsigned char* cp = (unsigned char*)c1Data + 48 * ce;
+                                if (*(uint64_t*)(cp + 0) == c1Key) {
+                                    *(uint64_t*)(cp + 8) = *(uint64_t*)&ornFn; break;
+                                }
                             }
+                            B5WeaponConfig::CachePartOverride(sid, wepFN, c1Key, 0, *(uint64_t*)&ornFn);
+                        } else {
+                            // The ornament `type` is the part-skin token: DT_ItemType.json
+                            // classifies SMGTigerMZL / SMGTigerGRP (and PartOri) as
+                            // EPBItemType::WeaponPartSkin — exactly the value WeaponPartSkinID
+                            // expects. The `id` (e.g. GSW-SMG_PTTiger) has no DT_ItemType entry
+                            // at all, so writing it there can never resolve; that was the bug
+                            // the [SKIN-DT] "NOT IN ANY SKIN TABLE" log line exposed.
+                            // Leave the C1 default ("PartOri") in the input untouched.
+                            FName skinFn = MkN(pc.ornType);
+                            B5WeaponConfig::CachePartOverride(sid, wepFN, c1Key, *(uint64_t*)&skinFn, 0);
                         }
-                        B5WeaponConfig::CachePartOverride(wepFN, c1Key, *(uint64_t*)&ornFn, 0);
+                        char rb[320];
+                        sprintf_s(rb, "[LSYNC][ORN] part=%s type=%s id=%s -> %s=%s",
+                            pc.partId.c_str(), pc.ornType.empty() ? "<null>" : pc.ornType.c_str(),
+                            pc.ornId.c_str(),
+                            isPainting ? "paint(+0x18)" : "skin(+0x08)",
+                            isPainting ? pc.ornId.c_str() : pc.ornType.c_str());
+                        ODS(rb);
                     }
                 }
+
+                // Weapon suit (receiver/body) — expand {WeaponSuit, painting} into
+                // per-part skins. `WO-*` types are the badge slot, not a suit.
+                if (!wc.ornType.empty() && wc.ornType.rfind("WO-", 0) != 0)
+                    ApplySuitExpansion(sid, wepFN, wc, (unsigned char*)c1Data, c1Num,
+                                       (unsigned char*)c2Data, c2Num);
+
                 break;
             }
         }
@@ -855,12 +1035,16 @@ static bool ParseAndPush(const std::string& json, APBPlayerState* PS) {
                     if (!wv.is_object()) continue;
                     WeaponCfg wc;
                     wc.weaponId = wp.key();
-                    // Weapon ornament: check type before reading
+                    // Weapon ornament: {Type, Id} = {WeaponSuit, WeaponSuitePainting}
+                    // (e.g. SkinSMGTiger / SkinSMGTiger_PTTiger) or a WO-* badge.
                     auto oit = wv.find("ornament");
                     if (oit != wv.end() && oit->is_object()) {
                         auto idit = oit->find("id");
                         if (idit != oit->end() && idit->is_string())
                             wc.ornId = idit->get<std::string>();
+                        auto tyit = oit->find("type");
+                        if (tyit != oit->end() && tyit->is_string())
+                            wc.ornType = tyit->get<std::string>();
                     }
                     // Parts
                     auto pit = wv.find("parts");
@@ -877,6 +1061,10 @@ static bool ParseAndPush(const std::string& json, APBPlayerState* PS) {
                                 auto poid = poit->find("id");
                                 if (poid != poit->end() && poid->is_string())
                                     pc.ornId = poid->get<std::string>();
+                                // `type` is often null (PTOriginal) — treat null as "painting".
+                                auto poty = poit->find("type");
+                                if (poty != poit->end() && poty->is_string())
+                                    pc.ornType = poty->get<std::string>();
                             }
                             if (pc.slot >= 0 && !pc.partId.empty())
                                 wc.parts.push_back(std::move(pc));

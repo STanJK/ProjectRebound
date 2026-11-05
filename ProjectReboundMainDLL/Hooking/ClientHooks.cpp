@@ -17,6 +17,92 @@
 
 using namespace SDK;
 
+extern uintptr_t BaseAddress;
+
+// ======================================================
+//  B.5: skin FName resolution diagnostic
+// ======================================================
+
+// Recursively look up a row in a (possibly composite) DataTable, walking parent tables.
+static uint8* FindRowInTable(UDataTable* dt, const FName& key)
+{
+    for (int i = 0; i < dt->RowMap.Num(); ++i) {
+        const auto& pair = dt->RowMap[i];
+        if (pair.Key() == key) return pair.Value();
+    }
+    if (dt->IsA(UCompositeDataTable::StaticClass())) {
+        auto* comp = static_cast<UCompositeDataTable*>(dt);
+        for (int p = 0; p < comp->ParentTables.Num(); ++p) {
+            uint8* r = FindRowInTable(comp->ParentTables[p], key);
+            if (r) return r;
+        }
+    }
+    return nullptr;
+}
+
+// Resolve an injected skin/ornament FName through the skin-definition DataTable
+// (including composite parent tables) and log the row + skin asset chain.
+static void DumpSkinResolution(unsigned char* wpn)
+{
+    static int s_Limit = 0;
+    if (s_Limit >= 6) return;
+    ++s_Limit;
+
+    // Get the DataTable manager (engine subsystem).
+    auto* mgr = static_cast<UPBDataTableManager*>(
+        USubsystemBlueprintLibrary::GetEngineSubsystem(
+            TSubclassOf<UEngineSubsystem>(UPBDataTableManager::StaticClass())));
+    if (!mgr) { WriteLog("[SKIN-DT] no DataTableManager"); return; }
+
+    // Probe every skin-related DataTable to find which one holds the injected FName.
+    struct TableProbe { const char* name; UDataTable* table; };
+    TableProbe tables[] = {
+        { "WeaponSuit",        mgr->WeaponSuitDefinitionDataTable.Get() },
+        { "WeaponSuitPainting", mgr->WeaponSuitPaintingDefinitionDataTable.Get() },
+        { "PartSkinDef",       mgr->WeaponPartSkinDefinitionDataTable.Get() },
+        { "SkinPainting",      mgr->SkinPaintingDefinitionDataTable.Get() },
+        { "SkinTheme",         mgr->SkinThemeDataTable.Get() },
+        { "WeaponOrnament",    mgr->WeaponOrnamentDefinitionDataTable.Get() },
+    };
+
+    unsigned char* cfg = wpn + 0x3E8;                          // PartNetworkConfig
+    void*  partData = *reinterpret_cast<void**>(cfg + 0x10);   // WeaponPartConfigs data
+    int    partNum  = *reinterpret_cast<int*>(cfg + 0x18);
+
+    auto dumpOne = [&](const char* tag, uint64_t raw) {
+        if (!raw) return;
+        FName skinName;
+        *reinterpret_cast<uint64_t*>(&skinName) = raw;
+        std::string nameStr = skinName.ToString();
+
+        for (auto& probe : tables) {
+            if (!probe.table) continue;
+            uint8* row = FindRowInTable(probe.table, skinName);
+            if (row) {
+                char b[300];
+                sprintf_s(b, "[SKIN-DT] %s fname=%s -> in %s (row=%p)",
+                    tag, nameStr.c_str(), probe.name, (void*)row);
+                WriteLog(b);
+                return;
+            }
+        }
+        char b[260];
+        sprintf_s(b, "[SKIN-DT] %s fname=%s -> NOT IN ANY SKIN TABLE", tag, nameStr.c_str());
+        WriteLog(b);
+    };
+
+    // Weapon-level fields (OrnamentID @ +0x20, WeaponID @ +0x28, WeaponClassID @ +0x30).
+    dumpOne("ornament", *reinterpret_cast<uint64_t*>(cfg + 0x20));
+    dumpOne("weaponid", *reinterpret_cast<uint64_t*>(cfg + 0x28));
+    dumpOne("classid",  *reinterpret_cast<uint64_t*>(cfg + 0x30));
+
+    for (int i = 0; i < partNum && i < 6; ++i) {
+        unsigned char* p = reinterpret_cast<unsigned char*>(partData) + 32 * i;
+        dumpOne("skin", *reinterpret_cast<uint64_t*>(p + 0x08));      // WeaponPartSkinID (mesh, "PartOri")
+        dumpOne("paint", *reinterpret_cast<uint64_t*>(p + 0x18));     // WeaponPartSkinPaintingID (color)
+    }
+}
+
 // ======================================================
 //  ProcessEventHookClient — client-side dispatch
 // ======================================================
@@ -171,27 +257,37 @@ void ProcessEventHookClient(UObject *Object, UFunction *Function, void *Parms)
 
             weaponToRefresh->InitWeapon(*cfg, /*bIsOnlyModel=*/false);
             weaponToRefresh->ApplyPartModification();
-            // Call the BP override of NotifyRecalculateSpecialPartOffset on the
-            // weapon's ACTUAL class, which re-derives AmmoPerClip from the custom
-            // attachments (the PBWeapon base impl does NOT).
-            {
-                // Walk the class hierarchy (CSTM_Base_C parent) to find the override.
-                UFunction* recalc = nullptr;
-                for (UStruct* c = weaponToRefresh->Class; c && !recalc; c = c->Super)
+            // The weapon's part/skin BP events are BlueprintImplementableEvents: the SDK
+            // wrapper resolves to the PBWeapon BASE declaration (no script → no-op), so we
+            // walk the hierarchy to find the CSTM_Base_C / WP_*_C override that actually has
+            // the BP script. (The SDK wrapper for K2_InitSimulatedPartsComplete was a silent
+            // no-op for exactly this reason.)
+            auto findAndCall = [&](const char* name) {
+                UFunction* fn = nullptr;
+                for (UStruct* c = weaponToRefresh->Class; c && !fn; c = c->Super)
                 {
                     for (UField* f = c->Children; f; f = f->Next)
                     {
-                        if (f->HasTypeFlag(EClassCastFlags::Function) && f->GetName() == "NotifyRecalculateSpecialPartOffset")
-                        { recalc = static_cast<UFunction*>(f); break; }
+                        if (f->HasTypeFlag(EClassCastFlags::Function) && f->GetName() == name)
+                        { fn = static_cast<UFunction*>(f); break; }
                     }
                 }
-                if (recalc)
-                    weaponToRefresh->ProcessEvent(recalc, nullptr);
-            }
-            // K2_InitSimulatedPartsComplete is what the native OnRep calls to apply
-            // the skins (trace shows OnRep → NotifyRecalculateSpecialPartOffset →
-            // K2_InitSimulatedPartsComplete, NOT K2_RefreshSkin). Call it every OnRep.
-            weaponToRefresh->K2_InitSimulatedPartsComplete();
+                if (fn)
+                    weaponToRefresh->ProcessEvent(fn, nullptr);
+            };
+
+            // Re-derives AmmoPerClip (capacity) from the custom attachments.
+            findAndCall("NotifyRecalculateSpecialPartOffset");
+            // Finishes "simulated parts" setup the native OnRep normally triggers.
+            findAndCall("K2_InitSimulatedPartsComplete");
+            // Skin-material candidates. K2_RefreshSkin was a wrong earlier guess; try the
+            // "refresh weapon data" events next (native OnRep doesn't reach the per-part skin).
+            findAndCall("K2_RefreshSkin");
+            findAndCall("K2_RefreshWeaponData");
+            findAndCall("RefreshWeaponData");
+
+            // B.5: dump how the game resolves the injected skin/ornament FNames.
+            DumpSkinResolution(wpn);
 
             *reinterpret_cast<int32*>(wpn + 0x0318) = savedAmmo;
             *reinterpret_cast<int32*>(wpn + 0x031C) = savedClip;
