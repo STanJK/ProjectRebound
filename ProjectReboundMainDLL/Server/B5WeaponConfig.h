@@ -43,10 +43,6 @@ struct FPartOverride
 using FWeaponPartCache = std::unordered_map<std::string,
     std::unordered_map<std::uint64_t, std::unordered_map<std::uint64_t, FPartOverride>>>;
 
-// Per-player cache: steamId → weaponFName_raw → weapon-level ornament FName_raw.
-using FWeaponOrnamentCache = std::unordered_map<std::string,
-    std::unordered_map<std::uint64_t, std::uint64_t>>;
-
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
@@ -76,20 +72,25 @@ void CachePartAttachment(const std::string& playerId,
                          std::uint64_t partIdRaw,
                          std::uint64_t attachmentFNameRaw);
 
-void CacheWeaponOrnament(const std::string& playerId,
-                         std::uint64_t weaponFNameRaw,
-                         std::uint64_t ornamentFNameRaw);
-
 // Accessor for the g_InB5NativeCall flag (shared with ProcessEvent hook).
 extern thread_local bool g_InB5NativeCall;
 
 // After cache is populated, re-apply custom configs to all existing
 // APBWeapon actors that match cached weapons. Returns count of weapons updated.
-// Call from ParseAndPush after ApplyCustomWeaponConfigs.
+// Call from ParseAndPush after ApplyCustomWeaponConfigs. Forces one full push
+// (unlike the tick path, which skips weapons already carrying the config).
 int ReapplyToExistingWeapons();
 
-// Called from TickFlush to continue reapplying for frames after cache init.
-// Returns true while still actively reapplying (limits to ~5 seconds).
+// Drop a departed player's cached overrides. Called by the slow prune sweep in
+// LoadoutSync once the player is gone for two consecutive sweeps.
+void PrunePlayer(const std::string& playerId);
+
+// Append the Steam IDs currently present in the cache (for that sweep).
+void CachedPlayerIds(std::vector<std::string>& out);
+
+// Called from TickFlush. Keeps covering weapons that spawn later (deploy,
+// respawn); cheap once a weapon has had its one-time OnRep. Returns true while
+// a cache exists.
 bool DeferredReapplyTick();
 
 } // namespace B5WeaponConfig

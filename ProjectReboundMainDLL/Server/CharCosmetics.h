@@ -19,6 +19,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 // One role's four character cosmetics, already converted to runtime FName raws
 // (0 = absent / "None").
@@ -49,5 +50,12 @@ int ReapplyToExistingCharacters();
 // Called from TickFlush; keeps covering characters that spawn later
 // (role selection, respawn). Returns true while a cache exists.
 bool DeferredReapplyTick();
+
+// Drop a departed player's cached cosmetics. Called by the slow prune sweep in
+// LoadoutSync once the player is gone for two consecutive sweeps.
+void PrunePlayer(const std::string& playerId);
+
+// Append the Steam IDs currently present in the cache (for that sweep).
+void CachedPlayerIds(std::vector<std::string>& out);
 
 } // namespace CharCosmetics

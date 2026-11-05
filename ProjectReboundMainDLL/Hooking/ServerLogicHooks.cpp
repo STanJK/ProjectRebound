@@ -168,9 +168,8 @@ void TickFlushHook(UNetDriver *NetDriver, float DeltaTime)
 
     UserNameFix_DrainPending();
     PVECamFix_Tick(NetDriver, DeltaTime);
-    LoadoutSync::SelfTestStart();
-    LoadoutSync::SelfTestDrain();
     LoadoutSync::DrainPending();
+    LoadoutSync::PruneStaleCaches();
     B5WeaponConfig::DeferredReapplyTick();
     CharCosmetics::DeferredReapplyTick();
 

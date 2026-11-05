@@ -1,6 +1,7 @@
 // LoadoutSync.h
-// One-way metaserver-to-DS loadout push.
-// Currently in SELF-TEST MODE: auto-fetches on server start, no client needed.
+// One-way metaserver-to-DS loadout push: PostLogin queues an HTTP fetch, and
+// TickFlush parses it on the game thread and pushes it into the player's
+// inventories, weapon caches and character cosmetics.
 
 #ifndef LOADOUTSYNC_H
 #define LOADOUTSYNC_H
@@ -18,23 +19,24 @@ extern thread_local bool g_InNativeCall;
 namespace LoadoutSync {
 
 struct PendingLoadout {
-    SDK::APBPlayerController* PC;
+    // Steam ID, not a controller pointer: the fetch runs on a detached thread and
+    // may finish after the player has left, so the controller is re-resolved on
+    // the game thread at drain time instead of being held across the wait.
+    std::string playerId;
     std::string json;
 };
 
 extern std::vector<PendingLoadout> g_Pending;
 extern std::mutex g_Mutex;
 
-// Player-join path (disabled during self-test)
+// Player-join path
 void OnPlayerJoined(SDK::AGameMode* GameMode, SDK::APBPlayerController* PC);
 void DrainPending();
 
-// B.5: set current spawn PlayerState for getter hook
-void SetSpawnPlayerState(SDK::APBPlayerState* PS);
-
-// Self-test: called from TickFlushHook
-void SelfTestStart();   // spawns HTTP worker thread (once)
-void SelfTestDrain();   // processes result on game thread (every frame until done)
+// Slow sweep (called from TickFlush): drops the per-player caches of players
+// who are gone, so a long-lived server does not accumulate one entry per player
+// that has ever joined. Requires two consecutive misses before dropping.
+void PruneStaleCaches();
 
 } // namespace LoadoutSync
 

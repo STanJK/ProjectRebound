@@ -25,8 +25,6 @@
 
 using namespace SDK;
 
-#define ODS(msg) WriteLog(msg)
-
 // ---------------------------------------------------------------------------
 // Cache
 // ---------------------------------------------------------------------------
@@ -105,7 +103,9 @@ static bool MatchesConfig(const FPBCharacterNetworkConfig& sc, const FCharCosmet
     if (!same(EPBSkinClass::Ornaments,   cfg.HeadFName))  return false;
     if (!same(EPBSkinClass::SpecialSlot, cfg.BadgeFName)) return false;
 
-    if (cfg.PaintFName && FNameRaw(sc.SkinPaintingID) != cfg.PaintFName)
+    // The paint is a single scalar, not part of the arrays, so it needs its own
+    // comparison: an empty PaintFName means "no paint" and must clear the field.
+    if (FNameRaw(sc.SkinPaintingID) != cfg.PaintFName)
         return false;
 
     return true;
@@ -135,8 +135,9 @@ static void WriteConfig(APBCharacter* chr, const FCharCosmeticCfg& cfg)
         sc.SkinClassArray.Add(EPBSkinClass::SpecialSlot);
         sc.SkinIDArray.Add(AsFName(cfg.BadgeFName));
     }
-    if (cfg.PaintFName)
-        sc.SkinPaintingID = AsFName(cfg.PaintFName);
+    // Always assigned: a loadout with no paint clears the scalar to "None"
+    // instead of leaving a previously applied one in place.
+    sc.SkinPaintingID = AsFName(cfg.PaintFName);
 }
 
 // ---------------------------------------------------------------------------
@@ -155,16 +156,13 @@ void CharCosmetics::CacheRoleCosmetics(const std::string& playerId,
 
     s_Cache[playerId][roleCI] = cfg;
 
-    const std::string roleStr = FNameRawToString(roleFNameRaw);
-    char dbg[512];
-    sprintf_s(dbg, "[CHAR-SKIN] cache player=%s role=%s skin=%s paint=%s head=%s badge=%s",
+    LogF("[CHAR-SKIN] cache player=%s role=%s skin=%s paint=%s head=%s badge=%s",
         playerId.c_str(),
-        roleStr.c_str(),
+        FNameRawToString(roleFNameRaw).c_str(),
         FNameRawToString(cfg.SkinFName).c_str(),
         FNameRawToString(cfg.PaintFName).c_str(),
         FNameRawToString(cfg.HeadFName).c_str(),
         FNameRawToString(cfg.BadgeFName).c_str());
-    ODS(dbg);
 }
 
 // ---------------------------------------------------------------------------
@@ -220,12 +218,10 @@ static int ReapplyToExistingCharactersImpl()
                     const std::string key = ownerId + "/" + std::to_string(roleCI);
                     if (s_MissLogged.insert(key).second)
                     {
-                        char miss[256];
-                        sprintf_s(miss, "[CHAR-SKIN] MISS owner=%s role=%s cachedRoles=%d",
+                        LogF("[CHAR-SKIN] MISS owner=%s role=%s cachedRoles=%d",
                             ownerId.c_str(),
                             roleCI ? roleFn.ToString().c_str() : "<none>",
                             (int)pIt->second.size());
-                        ODS(miss);
                     }
                 }
                 continue;
@@ -251,7 +247,7 @@ static int ReapplyToExistingCharactersImpl()
             }
             else
             {
-                ODS("[CHAR-SKIN] OnRep_CharacterSkinConfig not found on class");
+                WriteLog("[CHAR-SKIN] OnRep_CharacterSkinConfig not found on class");
             }
 
             // Make sure the changed struct is re-sent to the owning client.
@@ -261,16 +257,13 @@ static int ReapplyToExistingCharactersImpl()
 
             ++applied;
 
-            const std::string roleStr = roleFn.ToString();
-            char dbg[512];
-            sprintf_s(dbg, "[CHAR-SKIN] apply owner=%s role=%s skin=%s paint=%s head=%s badge=%s",
+            LogF("[CHAR-SKIN] apply owner=%s role=%s skin=%s paint=%s head=%s badge=%s",
                 ownerId.c_str(),
-                roleStr.c_str(),
+                roleFn.ToString().c_str(),
                 FNameRawToString(cfg.SkinFName).c_str(),
                 FNameRawToString(cfg.PaintFName).c_str(),
                 FNameRawToString(cfg.HeadFName).c_str(),
                 FNameRawToString(cfg.BadgeFName).c_str());
-            ODS(dbg);
         }
     }
 
@@ -283,10 +276,20 @@ namespace CharCosmetics
 int ReapplyToExistingCharacters()
 {
     const int count = ReapplyToExistingCharactersImpl();
-    char buf[80];
-    sprintf_s(buf, "[CHAR-SKIN] Done: %d characters updated", count);
-    ODS(buf);
+    LogF("[CHAR-SKIN] Done: %d characters updated", count);
     return count;
+}
+
+void PrunePlayer(const std::string& playerId)
+{
+    if (!playerId.empty())
+        s_Cache.erase(playerId);
+}
+
+void CachedPlayerIds(std::vector<std::string>& out)
+{
+    for (const auto& entry : s_Cache)
+        out.push_back(entry.first);
 }
 
 bool DeferredReapplyTick()
@@ -304,11 +307,7 @@ bool DeferredReapplyTick()
 
     const int count = ReapplyToExistingCharactersImpl();
     if (count > 0)
-    {
-        char buf[96];
-        sprintf_s(buf, "[CHAR-SKIN] tick %d: %d characters updated", s_TickCounter, count);
-        ODS(buf);
-    }
+        LogF("[CHAR-SKIN] tick %d: %d characters updated", s_TickCounter, count);
 
     return true;
 }
